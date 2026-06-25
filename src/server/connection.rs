@@ -290,6 +290,10 @@ impl ConnAuditTwoFactor {
     }
 }
 
+pub fn alive_connection_count() -> usize {
+    ALIVE_CONNS.lock().unwrap().len()
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Clone, Debug)]
 enum TerminalUserToken {
