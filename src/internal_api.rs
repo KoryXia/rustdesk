@@ -271,7 +271,7 @@ async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) -> Re
     let root = Root {
         bid: uuid::Uuid::new_v4().to_string(),
         tid: uuid::Uuid::new_v4().to_string(),
-        ts: now_millis(),
+        ts: chrono::Utc::now().timestamp_millis(),
         data: AbilityAckData {
             r#type: BUSINESS.to_owned(),
             action: Some(action.to_owned()),
