@@ -11,6 +11,7 @@ env:
   DISTRO: "ubuntu18.04"
   DEB_ARCH: "arm64"
   DEB_PACKAGE_NAME: "nc-rustdesk"
+  PACKAGE_SUFFIX: "hardcoded"
   VCPKG_TRIPLET: "arm64-linux"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
@@ -216,7 +217,7 @@ jobs:
             export DEB_PACKAGE_NAME=${{ env.DEB_PACKAGE_NAME }}
             python3 ./build.py --flutter --skip-cargo
             for name in $DEB_PACKAGE_NAME*??.deb; do
-              mv "$name" "${name%%.deb}-${{ env.ARCH }}.deb"
+              mv "$name" "${name%%.deb}-${{ env.PACKAGE_SUFFIX }}-${{ env.ARCH }}.deb"
             done
 
             # pushd /workspace
@@ -238,7 +239,7 @@ jobs:
       - name: Upload deb packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: rustdesk-linux-arm64-flutter-packages
+          name: rustdesk-linux-arm64-flutter-hardcoded-packages
           # Only upload deb packages; rpm artifacts are intentionally disabled.
           path: |
             nc-rustdesk-*.deb
