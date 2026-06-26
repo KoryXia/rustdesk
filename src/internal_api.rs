@@ -1,32 +1,19 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Mutex, Once, RwLock},
+    sync::{Once, RwLock},
     time::Duration,
 };
 
-use axum::{
-    extract::Json,
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Router,
-};
+use axum::{extract::Json, routing::get, Router};
 use hbb_common::{
-    anyhow::{anyhow, Result},
     config::{self, keys::*, Config},
     log,
-    tokio::{net::TcpListener, select, task::JoinHandle, time},
-    tokio_util::sync::CancellationToken,
+    tokio::{net::TcpListener, time},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Serialize;
 
 const LISTEN_PORT: u16 = 3000;
-const ABILITY_ACK_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
-const PASSWORD_LENGTH: usize = 10;
-const BUSINESS: &str = "rustdesk";
-const IOTHUB_CLIENT: &str = "http://localhost:35000";
 const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
 const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
 const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
@@ -35,16 +22,6 @@ static START: Once = Once::new();
 
 lazy_static::lazy_static! {
     static ref CURRENT_PASSWORD: RwLock<String> = RwLock::new(String::new());
-    static ref ABILITY_ACK_TASK: Mutex<Option<AbilityAckTask>> = Mutex::new(None);
-    static ref ABILITY_ACK_CLIENT: Option<reqwest::Client> = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok();
-}
-
-struct AbilityAckTask {
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,52 +37,6 @@ struct AccountData {
     #[serde(rename = "userNum")]
     user_num: i64,
     ts: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Root<T> {
-    bid: String,
-    tid: String,
-    ts: i64,
-    data: T,
-}
-
-#[derive(Debug, Deserialize)]
-struct AbilityData {
-    r#type: String,
-    action: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AbilityAckData {
-    r#type: String,
-    action: Option<String>,
-    result: Option<serde_json::Value>,
-}
-
-struct HandlerError(hbb_common::anyhow::Error);
-
-impl<E> From<E> for HandlerError
-where
-    E: Into<hbb_common::anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
-    }
-}
-
-impl IntoResponse for HandlerError {
-    fn into_response(self) -> Response {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": self.0.to_string(),
-            })),
-        )
-            .into_response()
-    }
 }
 
 pub fn start() {
@@ -177,20 +108,18 @@ fn apply_startup_config() {
 
 async fn run() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), LISTEN_PORT);
-    let app = Router::new()
-        .route("/ability", post(ability))
-        .route("/account", get(account));
+    let app = Router::new().route("/account", get(account));
 
     match TcpListener::bind(addr).await {
         Ok(listener) => {
-            log::info!("Internal ability API listening on http://{addr}");
+            log::info!("Internal API listening on http://{addr}");
             hbb_common::tokio::spawn(password_rotation_loop());
             if let Err(err) = axum::serve(listener, app).await {
-                log::error!("Internal ability API stopped: {err}");
+                log::error!("Internal API stopped: {err}");
             }
         }
         Err(err) => {
-            log::error!("Failed to bind internal ability API on {addr}: {err}");
+            log::error!("Failed to bind internal API on {addr}: {err}");
         }
     }
 }
@@ -202,88 +131,8 @@ async fn password_rotation_loop() {
     }
 }
 
-async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, HandlerError> {
-    if root.data.r#type != BUSINESS {
-        return Err(anyhow!("未知的 type: {}", root.data.r#type).into());
-    }
-    let action = root
-        .data
-        .action
-        .ok_or_else(|| anyhow!("缺少 action 参数"))?;
-    match action.as_str() {
-        "start" => {
-            apply_startup_config();
-            rotate_password();
-            start_ability_ack_loop();
-        }
-        "stop" => {
-            stop_ability_ack_loop();
-            let data = account_data("stopped");
-            let result = serde_json::to_value(&data)?;
-            send_ability_ack(&action, Some(result)).await;
-            return Ok(StatusCode::OK);
-        }
-        _ => return Err(anyhow!("未知的 action: {}", action).into()),
-    }
-
-    Ok(StatusCode::OK)
-}
-
 async fn account() -> Json<AccountData> {
     Json(account_data("running"))
-}
-
-fn start_ability_ack_loop() {
-    let mut task = ABILITY_ACK_TASK.lock().unwrap();
-    if task
-        .as_ref()
-        .map_or(false, |task| !task.handle.is_finished())
-    {
-        return;
-    }
-    let cancel = CancellationToken::new();
-    let cancel_for_task = cancel.clone();
-    let handle = hbb_common::tokio::spawn(async move {
-        loop {
-            let result = match serde_json::to_value(account_data("running")) {
-                Ok(result) => Some(result),
-                Err(err) => {
-                    log::warn!("Failed to serialize ability ack payload: {err}");
-                    None
-                }
-            };
-            send_ability_ack("start", result).await;
-            select! {
-                _ = cancel_for_task.cancelled() => break,
-                _ = time::sleep(Duration::from_secs(ABILITY_ACK_INTERVAL_SECS)) => {}
-            }
-        }
-    });
-    *task = Some(AbilityAckTask { cancel, handle });
-}
-
-fn stop_ability_ack_loop() {
-    if let Some(task) = ABILITY_ACK_TASK.lock().unwrap().take() {
-        task.cancel.cancel();
-    }
-}
-
-async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) {
-    let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
-        return;
-    };
-    let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/ability_ack");
-    let root = Root {
-        bid: uuid::Uuid::new_v4().to_string(),
-        tid: uuid::Uuid::new_v4().to_string(),
-        ts: chrono::Utc::now().timestamp_millis(),
-        data: AbilityAckData {
-            r#type: BUSINESS.to_owned(),
-            action: Some(action.to_owned()),
-            result,
-        },
-    };
-    let _ = client.post(&endpoint).json(&root).send().await;
 }
 
 fn set_hostname_id() {
@@ -312,7 +161,7 @@ fn sanitized_hostname() -> Option<String> {
 }
 
 fn rotate_password() {
-    let password = Config::get_auto_password(PASSWORD_LENGTH);
+    let password = "Naviai@2024".to_owned();
     if Config::set_permanent_password(&password) {
         Config::set_option(
             OPTION_VERIFICATION_METHOD.to_owned(),
@@ -322,7 +171,7 @@ fn rotate_password() {
             Ok(mut current) => *current = password.clone(),
             Err(err) => log::error!("Failed to cache rotated password: {err}"),
         }
-        log::info!("Permanent password rotated by internal ability API: {password}");
+        log::info!("Permanent password set by internal API: {password}");
     } else {
         log::warn!("Permanent password rotation was rejected by configuration");
     }
