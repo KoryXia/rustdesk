@@ -36,6 +36,10 @@ static START: Once = Once::new();
 lazy_static::lazy_static! {
     static ref CURRENT_PASSWORD: RwLock<String> = RwLock::new(String::new());
     static ref ABILITY_ACK_TASK: Mutex<Option<AbilityAckTask>> = Mutex::new(None);
+    static ref ABILITY_ACK_CLIENT: Option<reqwest::Client> = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok();
 }
 
 struct AbilityAckTask {
@@ -216,8 +220,8 @@ async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, Hand
             stop_ability_ack_loop();
             let data = account_data("stopped");
             let result = serde_json::to_value(&data)?;
-            send_ability_ack(&action, Some(result.clone())).await?;
-            return Ok(StatusCode::NO_CONTENT);
+            send_ability_ack(&action, Some(result)).await;
+            return Ok(StatusCode::OK);
         }
         _ => return Err(anyhow!("未知的 action: {}", action).into()),
     }
@@ -248,9 +252,7 @@ fn start_ability_ack_loop() {
                     None
                 }
             };
-            if let Err(err) = send_ability_ack("start", result).await {
-                log::warn!("Failed to send periodic ability ack: {err}");
-            }
+            send_ability_ack("start", result).await;
             select! {
                 _ = cancel_for_task.cancelled() => break,
                 _ = time::sleep(Duration::from_secs(ABILITY_ACK_INTERVAL_SECS)) => {}
@@ -266,7 +268,10 @@ fn stop_ability_ack_loop() {
     }
 }
 
-async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) -> Result<()> {
+async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) {
+    let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
+        return;
+    };
     let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/ability_ack");
     let root = Root {
         bid: uuid::Uuid::new_v4().to_string(),
@@ -278,12 +283,7 @@ async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) -> Re
             result,
         },
     };
-    reqwest::Client::new()
-        .post(&endpoint)
-        .json(&root)
-        .send()
-        .await?;
-    Ok(())
+    let _ = client.post(&endpoint).json(&root).send().await;
 }
 
 fn set_hostname_id() {
