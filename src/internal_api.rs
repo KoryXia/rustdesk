@@ -23,6 +23,7 @@ use serde_json::json;
 
 const LISTEN_PORT: u16 = 3000;
 const ABILITY_ACK_INTERVAL_SECS: u64 = 30;
+const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
 const BUSINESS: &str = "rustdesk";
@@ -184,6 +185,7 @@ async fn run() {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("Internal ability API listening on http://{addr}");
+            start_registration(LISTEN_PORT);
             hbb_common::tokio::spawn(password_rotation_loop());
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
@@ -193,6 +195,33 @@ async fn run() {
             log::error!("Failed to bind internal ability API on {addr}: {err}");
         }
     }
+}
+
+fn start_registration(port: u16) {
+    hbb_common::tokio::spawn(async move {
+        let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
+            return;
+        };
+        let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/register");
+        let payload = json!({
+            "business": BUSINESS,
+            "port": port,
+        });
+        let mut ticker = time::interval(Duration::from_secs(REGISTER_INTERVAL_SECS));
+
+        loop {
+            ticker.tick().await;
+            if let Err(err) = client
+                .post(&endpoint)
+                .json(&payload)
+                .send()
+                .await
+                .and_then(|resp| resp.error_for_status())
+            {
+                log::warn!("Failed to register rustdesk service to iothub-client: {err}");
+            }
+        }
+    });
 }
 
 async fn password_rotation_loop() {
