@@ -244,6 +244,36 @@ pub fn alive_connection_count() -> usize {
     ALIVE_CONNS.lock().unwrap().len()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+enum ConnAuditPrimaryAuth {
+    None = 0,
+    Click = 1,
+    TemporaryPassword = 2,
+    PermanentPassword = 3,
+    SwitchSides = 4,
+}
+
+impl ConnAuditPrimaryAuth {
+    fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+enum ConnAuditTwoFactor {
+    None = 0,
+    Totp = 1,
+    TrustedDevice = 2,
+}
+
+impl ConnAuditTwoFactor {
+    fn as_i64(self) -> i64 {
+        self as i64
+    }
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Clone, Debug)]
 enum TerminalUserToken {
@@ -349,6 +379,8 @@ pub struct Connection {
     // For post requests that need to be sent sequentially.
     // eg. post_conn_audit
     tx_post_seq: mpsc::UnboundedSender<(String, Value)>,
+    conn_audit_primary_auth: ConnAuditPrimaryAuth,
+    conn_audit_two_factor: ConnAuditTwoFactor,
     // Tracks read job IDs delegated to CM process.
     // When a read job is delegated to CM (via FS::ReadFile), the job id is added here.
     // Used to filter stale responses (FileBlockFromCM, FileReadDone, etc.) for
@@ -546,6 +578,8 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal_user_token: None,
             terminal_generic_service: None,
+            conn_audit_primary_auth: ConnAuditPrimaryAuth::None,
+            conn_audit_two_factor: ConnAuditTwoFactor::None,
         };
         let addr = hbb_common::try_into_v4(addr);
         if !conn.on_open(addr).await {
@@ -629,6 +663,7 @@ impl Connection {
                 Some(data) = rx_from_cm.recv() => {
                     match data {
                         ipc::Data::Authorize => {
+                            conn.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::Click);
                             conn.require_2fa.take();
                             if !conn.send_logon_response_and_keep_alive().await {
                                 break;
@@ -1475,6 +1510,23 @@ impl Connection {
         crate::post_request(url, v.to_string(), "").await
     }
 
+    fn set_conn_audit_primary_auth(&mut self, method: ConnAuditPrimaryAuth) {
+        self.conn_audit_primary_auth = method;
+    }
+
+    fn set_conn_audit_two_factor(&mut self, two_factor: ConnAuditTwoFactor) {
+        self.conn_audit_two_factor = two_factor;
+    }
+
+    fn normalize_conn_audit_auth_fields(&mut self) {
+        if matches!(
+            self.conn_audit_primary_auth,
+            ConnAuditPrimaryAuth::Click | ConnAuditPrimaryAuth::SwitchSides
+        ) {
+            self.conn_audit_two_factor = ConnAuditTwoFactor::None;
+        }
+    }
+
     fn normalize_port_forward_target(pf: &mut PortForward) -> (String, bool) {
         let mut is_rdp = false;
         if pf.host == "RDP" && pf.port == 0 {
@@ -1598,10 +1650,15 @@ impl Connection {
             .unwrap()
             .get(&self.session_key())
             .map(|s| s.last_recv_time.clone());
-        self.post_conn_audit(json!({
-            "peer": ((&self.lr.my_id, &self.lr.my_name)),
-            "type": conn_type,
-        }));
+        self.normalize_conn_audit_auth_fields();
+        let mut audit = json!({"peer": ((&self.lr.my_id, &self.lr.my_name)), "type": conn_type});
+        if self.conn_audit_primary_auth != ConnAuditPrimaryAuth::None {
+            audit["primary_auth"] = json!(self.conn_audit_primary_auth.as_i64());
+        }
+        if self.conn_audit_two_factor != ConnAuditTwoFactor::None {
+            audit["two_factor"] = json!(self.conn_audit_two_factor.as_i64());
+        }
+        self.post_conn_audit(audit);
         #[allow(unused_mut)]
         let mut username = crate::platform::get_active_username();
         let mut res = LoginResponse::new();
@@ -2213,6 +2270,7 @@ impl Connection {
         if password::temporary_enabled() {
             let password = password::temporary_password();
             if self.validate_password_plain(&password) {
+                self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
                 raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
                     Some(password),
@@ -2236,6 +2294,7 @@ impl Connection {
                 if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
                     && self.validate_password_storage(&local_storage)
                 {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
                     print_fallback();
                     return true;
                 }
@@ -2244,6 +2303,7 @@ impl Connection {
                 if preset_permanent_password_storage_is_usable_for_auth(&hard, &salt)
                     && self.validate_preset_password_storage(&hard, &salt)
                 {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
                     print_fallback();
                     return true;
                 }
@@ -2268,6 +2328,11 @@ impl Connection {
                 && (tfa && session.tfa
                     || !tfa && self.validate_password_plain(&session.random_password))
             {
+                if tfa {
+                    self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
+                } else {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
+                }
                 log::info!("is recent session");
                 return true;
             }
@@ -2361,6 +2426,7 @@ impl Connection {
                     && device.platform == lr.my_platform
                 {
                     log::info!("2FA bypassed by trusted devices");
+                    self.set_conn_audit_two_factor(ConnAuditTwoFactor::TrustedDevice);
                     self.require_2fa = None;
                 }
             }
@@ -2653,6 +2719,7 @@ impl Connection {
                     if res {
                         self.update_failure(failure, true, 1);
                         self.require_2fa.take();
+                        self.set_conn_audit_two_factor(ConnAuditTwoFactor::Totp);
                         raii::AuthedConnID::set_session_2fa(self.session_key());
                         if !self.send_logon_response_and_keep_alive().await {
                             return false;
@@ -2708,6 +2775,7 @@ impl Connection {
                     if let Some((_instant, uuid_old)) = uuid_old {
                         if uuid == uuid_old {
                             self.from_switch = true;
+                            self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
                             if !self.send_logon_response_and_keep_alive().await {
                                 return false;
                             }
