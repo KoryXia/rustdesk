@@ -1,0 +1,216 @@
+name: Build Linux x64 Flutter
+
+on:
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.75"
+  FLUTTER_VERSION: "3.24.5"
+  TARGET: "x86_64-unknown-linux-gnu"
+  ARCH: "x86_64"
+  DISTRO: "ubuntu18.04"
+  DEB_ARCH: "amd64"
+  DEB_PACKAGE_NAME: "nc-rustdesk"
+  PACKAGE_SUFFIX: "hardcoded"
+  VCPKG_TRIPLET: "x64-linux"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VERSION: "1.4.8"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-linux-x64-flutter:
+    name: build rustdesk linux x64 flutter
+    needs: [generate-bridge]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Maximize build space
+        shell: bash
+        run: |
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo apt-get update -y
+          sudo apt-get install -y nasm
+          df -h
+          free -m
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Free Space
+        shell: bash
+        run: |
+          df -h
+          free -m
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - name: Save Rust toolchain version
+        shell: bash
+        run: |
+          RUST_TOOLCHAIN_VERSION=$(cargo --version | awk '{print $2}')
+          echo "RUST_TOOLCHAIN_VERSION=$RUST_TOOLCHAIN_VERSION" >> "$GITHUB_ENV"
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+          VCPKG_DEFAULT_HOST_TRIPLET: ${{ env.VCPKG_TRIPLET }}
+        run: |
+          sudo apt-get install -y libva-dev
+          if ! "$VCPKG_ROOT/vcpkg" install --triplet "${{ env.VCPKG_TRIPLET }}" --x-install-root="$VCPKG_ROOT/installed"; then
+            find "$VCPKG_ROOT" -name "*.log" | while read -r log_file; do
+              echo "$log_file:"
+              echo "======"
+              cat "$log_file"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "$VCPKG_ROOT/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
+
+      - name: Build rustdesk linux x64 flutter
+        uses: rustdesk-org/run-on-arch-action@d3fcfbb632b84cf7f6bc772bfaaa2c2f4f8789a8
+        env:
+          RUSTDESK_ID_SERVER: ${{ vars.RUSTDESK_ID_SERVER }}
+          RUSTDESK_RELAY_SERVER: ${{ vars.RUSTDESK_RELAY_SERVER }}
+          RUSTDESK_SERVER_KEY: ${{ secrets.RUSTDESK_SERVER_KEY }}
+        with:
+          arch: ${{ env.ARCH }}
+          distro: ${{ env.DISTRO }}
+          githubToken: ${{ github.token }}
+          setup: |
+            ls -l "${PWD}"
+            ls -l /opt/artifacts/vcpkg/installed
+          dockerRunArgs: |
+            --volume "${PWD}:/workspace"
+            --volume "/opt/artifacts:/opt/artifacts"
+            --env "RUSTDESK_ID_SERVER=${{ vars.RUSTDESK_ID_SERVER }}"
+            --env "RUSTDESK_RELAY_SERVER=${{ vars.RUSTDESK_RELAY_SERVER }}"
+            --env "RUSTDESK_SERVER_KEY=${{ secrets.RUSTDESK_SERVER_KEY }}"
+          shell: /bin/bash
+          install: |
+            apt-get update -y
+            echo -e "installing deps"
+            # rpm is not needed because this workflow only builds deb packages.
+            apt-get install -y \
+               build-essential \
+               clang \
+               cmake \
+               curl \
+               gcc \
+               git \
+               g++ \
+               libayatana-appindicator3-dev \
+               libasound2-dev \
+               libclang-10-dev \
+               libgstreamer1.0-dev \
+               libgstreamer-plugins-base1.0-dev \
+               libgtk-3-dev \
+               libpam0g-dev \
+               libpulse-dev \
+               libva-dev \
+               libxcb-randr0-dev \
+               libxcb-shape0-dev \
+               libxcb-xfixes0-dev \
+               libxdo-dev \
+               libxfixes-dev \
+               llvm-10-dev \
+               nasm \
+               ninja-build \
+               pkg-config \
+               tree \
+               python3 \
+               unzip \
+               wget \
+               xz-utils \
+               libssl-dev
+            apt-get remove -y libopus-dev || true
+            ls -l ./
+            tree -L 3 /opt/artifacts/vcpkg/installed
+          run: |
+            git config --global --add safe.directory "*"
+            pushd /opt
+            wget -O rust.tar.gz https://static.rust-lang.org/dist/rust-${{ env.RUST_TOOLCHAIN_VERSION }}-${{ env.TARGET }}.tar.gz
+            tar -zxvf rust.tar.gz > /dev/null
+            rm rust.tar.gz
+            cd rust-${{ env.RUST_TOOLCHAIN_VERSION }}-${{ env.TARGET }}
+            ./install.sh
+            rm -rf rust-${{ env.RUST_TOOLCHAIN_VERSION }}-${{ env.TARGET }}
+
+            mkdir -p ~/.cargo/
+            echo """
+              [source.crates-io]
+              registry = 'https://github.com/rust-lang/crates.io-index'
+            """ > ~/.cargo/config
+            cat ~/.cargo/config
+
+            pushd /workspace
+            export VCPKG_ROOT=/opt/artifacts/vcpkg
+            export VCPKG_DEFAULT_TRIPLET=${{ env.VCPKG_TRIPLET }}
+            export VCPKG_DEFAULT_HOST_TRIPLET=${{ env.VCPKG_TRIPLET }}
+            cargo build --locked --lib --features hwcodec,flutter,unix-file-copy-paste --release
+            rm -rf target/release/deps target/release/build
+            rm -rf ~/.cargo
+
+            git config --global --add safe.directory "*"
+            export PATH=/opt/flutter/bin:$PATH
+
+            pushd /opt
+            wget https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            tar xf flutter_linux_${{ env.FLUTTER_VERSION }}-stable.tar.xz
+            flutter doctor -v
+
+            if [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]]; then
+              pushd /opt/flutter
+              git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+              popd
+            fi
+
+            pushd /workspace
+            export CARGO_INCREMENTAL=0
+            export DEB_ARCH=${{ env.DEB_ARCH }}
+            export DEB_PACKAGE_NAME=${{ env.DEB_PACKAGE_NAME }}
+            python3 ./build.py --flutter --skip-cargo
+            for name in $DEB_PACKAGE_NAME*??.deb; do
+              mv "$name" "${name%%.deb}-${{ env.PACKAGE_SUFFIX }}-${{ env.ARCH }}.deb"
+            done
+
+      - name: Upload deb packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-linux-x64-flutter-hardcoded-packages
+          # Only upload deb packages; rpm artifacts are intentionally disabled.
+          path: |
+            nc-rustdesk-*.deb
