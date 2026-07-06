@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const LISTEN_PORT: u16 = 3000;
-const ABILITY_ACK_INTERVAL_SECS: u64 = 60;
+const ABILITY_ACK_INTERVAL_SECS: u64 = 30;
+const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
@@ -187,6 +188,7 @@ async fn run() {
             log::info!("Internal ability API listening on http://{addr}");
             start_registration(LISTEN_PORT);
             hbb_common::tokio::spawn(password_rotation_loop());
+            hbb_common::tokio::spawn(alive_connection_watch_loop());
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
             }
@@ -256,12 +258,26 @@ async fn account() -> Json<AccountData> {
     Json(account_data("running"))
 }
 
-// Loops: password rotation and ability ack.
+// Loops: password rotation, connection count watch, and ability ack.
 async fn password_rotation_loop() {
     loop {
         time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
         if rotate_password() && ability_ack_loop_running() {
             send_ability_ack("start", "running").await;
+        }
+    }
+}
+
+async fn alive_connection_watch_loop() {
+    let mut last = crate::server::alive_connection_count();
+    loop {
+        time::sleep(Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS)).await;
+        let current = crate::server::alive_connection_count();
+        if current != last {
+            last = current;
+            if ability_ack_loop_running() {
+                send_ability_ack("start", "running").await;
+            }
         }
     }
 }
