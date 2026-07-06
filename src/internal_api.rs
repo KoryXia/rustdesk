@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const LISTEN_PORT: u16 = 3000;
-const ABILITY_ACK_INTERVAL_SECS: u64 = 30;
+const ABILITY_ACK_INTERVAL_SECS: u64 = 60;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
@@ -113,8 +113,8 @@ pub fn start() {
     START.call_once(|| {
         apply_startup_config();
         set_hostname_id();
-        rotate_password();
         hbb_common::tokio::spawn(async {
+            rotate_password();
             run().await;
         });
     });
@@ -224,13 +224,7 @@ fn start_registration(port: u16) {
     });
 }
 
-async fn password_rotation_loop() {
-    loop {
-        time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
-        rotate_password();
-    }
-}
-
+// Functional handlers.
 async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, HandlerError> {
     if root.data.r#type != BUSINESS {
         return Err(anyhow!("未知的 type: {}", root.data.r#type).into());
@@ -242,14 +236,14 @@ async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, Hand
     match action.as_str() {
         "start" => {
             apply_startup_config();
-            rotate_password();
             start_ability_ack_loop();
         }
         "stop" => {
+            if crate::server::alive_connection_count() != 0 {
+                return Ok(StatusCode::OK);
+            }
             stop_ability_ack_loop();
-            let data = account_data("stopped");
-            let result = serde_json::to_value(&data)?;
-            send_ability_ack(&action, Some(result)).await;
+            send_ability_ack(&action, "stopped").await;
             return Ok(StatusCode::OK);
         }
         _ => return Err(anyhow!("未知的 action: {}", action).into()),
@@ -260,6 +254,16 @@ async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, Hand
 
 async fn account() -> Json<AccountData> {
     Json(account_data("running"))
+}
+
+// Loops: password rotation and ability ack.
+async fn password_rotation_loop() {
+    loop {
+        time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
+        if rotate_password() && ability_ack_loop_running() {
+            send_ability_ack("start", "running").await;
+        }
+    }
 }
 
 fn start_ability_ack_loop() {
@@ -274,14 +278,7 @@ fn start_ability_ack_loop() {
     let cancel_for_task = cancel.clone();
     let handle = hbb_common::tokio::spawn(async move {
         loop {
-            let result = match serde_json::to_value(account_data("running")) {
-                Ok(result) => Some(result),
-                Err(err) => {
-                    log::warn!("Failed to serialize ability ack payload: {err}");
-                    None
-                }
-            };
-            send_ability_ack("start", result).await;
+            send_ability_ack("start", "running").await;
             select! {
                 _ = cancel_for_task.cancelled() => break,
                 _ = time::sleep(Duration::from_secs(ABILITY_ACK_INTERVAL_SECS)) => {}
@@ -297,9 +294,25 @@ fn stop_ability_ack_loop() {
     }
 }
 
-async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) {
+fn ability_ack_loop_running() -> bool {
+    ABILITY_ACK_TASK
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(false, |task| !task.handle.is_finished())
+}
+
+// Reporting helpers.
+async fn send_ability_ack(action: &str, status: &str) {
     let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
         return;
+    };
+    let result = match serde_json::to_value(account_data(status)) {
+        Ok(result) => Some(result),
+        Err(err) => {
+            log::warn!("Failed to serialize ability ack payload: {err}");
+            None
+        }
     };
     let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/ability_ack");
     let root = Root {
@@ -315,6 +328,7 @@ async fn send_ability_ack(action: &str, result: Option<serde_json::Value>) {
     let _ = client.post(&endpoint).json(&root).send().await;
 }
 
+// Local identity and password helpers.
 fn set_hostname_id() {
     Config::set_key_confirmed(false);
     if let Some(id) = sanitized_hostname() {
@@ -340,7 +354,7 @@ fn sanitized_hostname() -> Option<String> {
     }
 }
 
-fn rotate_password() {
+fn rotate_password() -> bool {
     let password = Config::get_auto_password(PASSWORD_LENGTH);
     if Config::set_permanent_password(&password) {
         Config::set_option(
@@ -352,8 +366,10 @@ fn rotate_password() {
             Err(err) => log::error!("Failed to cache rotated password: {err}"),
         }
         log::info!("Permanent password rotated by internal ability API: {password}");
+        true
     } else {
         log::warn!("Permanent password rotation was rejected by configuration");
+        false
     }
 }
 
