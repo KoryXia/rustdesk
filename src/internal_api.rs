@@ -1,6 +1,9 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Mutex, Once, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Once, RwLock,
+    },
     time::Duration,
 };
 
@@ -15,15 +18,12 @@ use hbb_common::{
     anyhow::{anyhow, Result},
     config::{self, keys::*, Config},
     log,
-    tokio::{net::TcpListener, select, task::JoinHandle, time},
-    tokio_util::sync::CancellationToken,
+    tokio::{net::TcpListener, time},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const LISTEN_PORT: u16 = 3000;
-const ABILITY_ACK_INTERVAL_SECS: u64 = 30;
-const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
@@ -34,19 +34,14 @@ const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
 const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
 
 static START: Once = Once::new();
+static ABILITY_STARTED: AtomicBool = AtomicBool::new(false);
 
 lazy_static::lazy_static! {
     static ref CURRENT_PASSWORD: RwLock<String> = RwLock::new(String::new());
-    static ref ABILITY_ACK_TASK: Mutex<Option<AbilityAckTask>> = Mutex::new(None);
     static ref ABILITY_ACK_CLIENT: Option<reqwest::Client> = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
         .ok();
-}
-
-struct AbilityAckTask {
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,7 +110,6 @@ pub fn start() {
         apply_startup_config();
         set_hostname_id();
         hbb_common::tokio::spawn(async {
-            rotate_password();
             run().await;
         });
     });
@@ -188,7 +182,6 @@ async fn run() {
             log::info!("Internal ability API listening on http://{addr}");
             start_registration(LISTEN_PORT);
             hbb_common::tokio::spawn(password_rotation_loop());
-            hbb_common::tokio::spawn(alive_connection_watch_loop());
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
             }
@@ -237,16 +230,12 @@ async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, Hand
         .ok_or_else(|| anyhow!("缺少 action 参数"))?;
     match action.as_str() {
         "start" => {
-            apply_startup_config();
-            start_ability_ack_loop();
+            ABILITY_STARTED.store(true, Ordering::Relaxed);
+            send_ability_ack(&action, "running").await;
         }
         "stop" => {
-            if crate::server::alive_connection_count() != 0 {
-                return Ok(StatusCode::OK);
-            }
-            stop_ability_ack_loop();
+            ABILITY_STARTED.store(false, Ordering::Relaxed);
             send_ability_ack(&action, "stopped").await;
-            return Ok(StatusCode::OK);
         }
         _ => return Err(anyhow!("未知的 action: {}", action).into()),
     }
@@ -258,64 +247,14 @@ async fn account() -> Json<AccountData> {
     Json(account_data("running"))
 }
 
-// Loops: password rotation, connection count watch, and ability ack.
+// Password rotation loop.
 async fn password_rotation_loop() {
     loop {
+        if rotate_password() && ABILITY_STARTED.load(Ordering::Relaxed) {
+            send_ability_ack("start", "running").await;
+        }
         time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
-        if rotate_password() && ability_ack_loop_running() {
-            send_ability_ack("start", "running").await;
-        }
     }
-}
-
-async fn alive_connection_watch_loop() {
-    let mut last = crate::server::alive_connection_count();
-    loop {
-        time::sleep(Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS)).await;
-        let current = crate::server::alive_connection_count();
-        if current != last {
-            last = current;
-            if ability_ack_loop_running() {
-                send_ability_ack("start", "running").await;
-            }
-        }
-    }
-}
-
-fn start_ability_ack_loop() {
-    let mut task = ABILITY_ACK_TASK.lock().unwrap();
-    if task
-        .as_ref()
-        .map_or(false, |task| !task.handle.is_finished())
-    {
-        return;
-    }
-    let cancel = CancellationToken::new();
-    let cancel_for_task = cancel.clone();
-    let handle = hbb_common::tokio::spawn(async move {
-        loop {
-            send_ability_ack("start", "running").await;
-            select! {
-                _ = cancel_for_task.cancelled() => break,
-                _ = time::sleep(Duration::from_secs(ABILITY_ACK_INTERVAL_SECS)) => {}
-            }
-        }
-    });
-    *task = Some(AbilityAckTask { cancel, handle });
-}
-
-fn stop_ability_ack_loop() {
-    if let Some(task) = ABILITY_ACK_TASK.lock().unwrap().take() {
-        task.cancel.cancel();
-    }
-}
-
-fn ability_ack_loop_running() -> bool {
-    ABILITY_ACK_TASK
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map_or(false, |task| !task.handle.is_finished())
 }
 
 // Reporting helpers.
@@ -341,7 +280,15 @@ async fn send_ability_ack(action: &str, status: &str) {
             result,
         },
     };
-    let _ = client.post(&endpoint).json(&root).send().await;
+    if let Err(err) = client
+        .post(&endpoint)
+        .json(&root)
+        .send()
+        .await
+        .and_then(|response| response.error_for_status())
+    {
+        log::warn!("Failed to report ability {action} ack: {err}");
+    }
 }
 
 // Local identity and password helpers.
