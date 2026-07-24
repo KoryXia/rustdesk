@@ -8,7 +8,7 @@ use std::{
 };
 
 use axum::{
-    extract::Json,
+    extract::{Json, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -18,12 +18,18 @@ use hbb_common::{
     anyhow::{anyhow, Result},
     config::{self, keys::*, Config},
     log,
-    tokio::{net::TcpListener, time},
+    tokio::{
+        net::TcpListener,
+        select,
+        sync::mpsc::{self, Receiver, Sender},
+        time,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const LISTEN_PORT: u16 = 3000;
+const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
@@ -42,6 +48,11 @@ lazy_static::lazy_static! {
         .timeout(Duration::from_secs(3))
         .build()
         .ok();
+}
+
+enum AbilityAckEvent {
+    Start,
+    Stop,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,8 +88,8 @@ struct AbilityData {
 #[derive(Debug, Serialize)]
 struct AbilityAckData {
     r#type: String,
-    action: Option<String>,
-    result: Option<serde_json::Value>,
+    action: String,
+    result: AccountData,
 }
 
 struct HandlerError(hbb_common::anyhow::Error);
@@ -110,6 +121,7 @@ pub fn start() {
         apply_startup_config();
         set_hostname_id();
         hbb_common::tokio::spawn(async {
+            rotate_password();
             run().await;
         });
     });
@@ -173,15 +185,17 @@ fn apply_startup_config() {
 
 async fn run() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), LISTEN_PORT);
+    let (ability_ack_tx, ability_ack_rx) = mpsc::channel(16);
     let app = Router::new()
         .route("/ability", post(ability))
-        .route("/account", get(account));
+        .route("/account", get(account))
+        .with_state(ability_ack_tx);
 
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("Internal ability API listening on http://{addr}");
             start_registration(LISTEN_PORT);
-            hbb_common::tokio::spawn(password_rotation_loop());
+            hbb_common::tokio::spawn(ability_ack_worker(ability_ack_rx));
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
             }
@@ -220,7 +234,10 @@ fn start_registration(port: u16) {
 }
 
 // Functional handlers.
-async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, HandlerError> {
+async fn ability(
+    State(ability_ack_tx): State<Sender<AbilityAckEvent>>,
+    Json(root): Json<Root<AbilityData>>,
+) -> Result<StatusCode, HandlerError> {
     if root.data.r#type != BUSINESS {
         return Err(anyhow!("未知的 type: {}", root.data.r#type).into());
     }
@@ -229,14 +246,8 @@ async fn ability(Json(root): Json<Root<AbilityData>>) -> Result<StatusCode, Hand
         .action
         .ok_or_else(|| anyhow!("缺少 action 参数"))?;
     match action.as_str() {
-        "start" => {
-            ABILITY_STARTED.store(true, Ordering::Relaxed);
-            send_ability_ack(&action, "running").await;
-        }
-        "stop" => {
-            ABILITY_STARTED.store(false, Ordering::Relaxed);
-            send_ability_ack(&action, "stopped").await;
-        }
+        "start" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Start).await,
+        "stop" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Stop).await,
         _ => return Err(anyhow!("未知的 action: {}", action).into()),
     }
 
@@ -247,27 +258,60 @@ async fn account() -> Json<AccountData> {
     Json(account_data("running"))
 }
 
-// Password rotation loop.
-async fn password_rotation_loop() {
-    loop {
-        if rotate_password() && ABILITY_STARTED.load(Ordering::Relaxed) {
-            send_ability_ack("start", "running").await;
-        }
-        time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
+// Reporting helpers.
+async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent) {
+    if tx.send(event).await.is_err() {
+        log::warn!("Failed to queue ability ack because the worker stopped");
     }
 }
 
-// Reporting helpers.
+async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
+    let now = time::Instant::now();
+    let password_interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
+    let alive_connection_interval = Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS);
+    let mut password_ticker = time::interval_at(now + password_interval, password_interval);
+    let mut alive_connection_ticker =
+        time::interval_at(now + alive_connection_interval, alive_connection_interval);
+    let mut last_alive_connection_count = crate::server::alive_connection_count();
+
+    loop {
+        select! {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match event {
+                    AbilityAckEvent::Start => {
+                        ABILITY_STARTED.store(true, Ordering::Relaxed);
+                        send_ability_ack("start", "running").await;
+                    }
+                    AbilityAckEvent::Stop => {
+                        ABILITY_STARTED.store(false, Ordering::Relaxed);
+                        send_ability_ack("stop", "stopped").await;
+                    }
+                }
+            }
+            _ = password_ticker.tick() => {
+                if rotate_password() && ABILITY_STARTED.load(Ordering::Relaxed) {
+                    send_ability_ack("start", "running").await;
+                }
+            }
+            _ = alive_connection_ticker.tick() => {
+                let current = crate::server::alive_connection_count();
+                if current != last_alive_connection_count {
+                    last_alive_connection_count = current;
+                    if ABILITY_STARTED.load(Ordering::Relaxed) {
+                        send_ability_ack("start", "running").await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn send_ability_ack(action: &str, status: &str) {
     let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
         return;
-    };
-    let result = match serde_json::to_value(account_data(status)) {
-        Ok(result) => Some(result),
-        Err(err) => {
-            log::warn!("Failed to serialize ability ack payload: {err}");
-            None
-        }
     };
     let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/ability_ack");
     let root = Root {
@@ -276,8 +320,8 @@ async fn send_ability_ack(action: &str, status: &str) {
         ts: chrono::Utc::now().timestamp_millis(),
         data: AbilityAckData {
             r#type: BUSINESS.to_owned(),
-            action: Some(action.to_owned()),
-            result,
+            action: action.to_owned(),
+            result: account_data(status),
         },
     };
     if let Err(err) = client
@@ -310,11 +354,7 @@ fn sanitized_hostname() -> Option<String> {
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect::<String>();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    (!id.is_empty()).then_some(id)
 }
 
 fn rotate_password() -> bool {
