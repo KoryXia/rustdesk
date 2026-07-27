@@ -18,6 +18,7 @@ use hbb_common::{
     anyhow::{anyhow, Result},
     config::{self, keys::*, Config},
     log,
+    sha2::{Digest, Sha256},
     tokio::{
         net::TcpListener,
         select,
@@ -31,8 +32,8 @@ use serde_json::json;
 const LISTEN_PORT: u16 = 3000;
 const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const REGISTER_INTERVAL_SECS: u64 = 30;
-const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const PASSWORD_LENGTH: usize = 10;
+const PASSWORD_CHARS: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const BUSINESS: &str = "rustdesk";
 const IOTHUB_CLIENT: &str = "http://localhost:35000";
 const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
@@ -121,7 +122,7 @@ pub fn start() {
         apply_startup_config();
         set_hostname_id();
         hbb_common::tokio::spawn(async {
-            rotate_password();
+            initialize_password();
             run().await;
         });
     });
@@ -267,9 +268,7 @@ async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent)
 
 async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
     let now = time::Instant::now();
-    let password_interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
     let alive_connection_interval = Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS);
-    let mut password_ticker = time::interval_at(now + password_interval, password_interval);
     let mut alive_connection_ticker =
         time::interval_at(now + alive_connection_interval, alive_connection_interval);
     let mut last_alive_connection_count = crate::server::alive_connection_count();
@@ -289,11 +288,6 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                         ABILITY_STARTED.store(false, Ordering::Relaxed);
                         send_ability_ack("stop", "stopped").await;
                     }
-                }
-            }
-            _ = password_ticker.tick() => {
-                if rotate_password() && ABILITY_STARTED.load(Ordering::Relaxed) {
-                    send_ability_ack("start", "running").await;
                 }
             }
             _ = alive_connection_ticker.tick() => {
@@ -357,8 +351,8 @@ fn sanitized_hostname() -> Option<String> {
     (!id.is_empty()).then_some(id)
 }
 
-fn rotate_password() -> bool {
-    let password = Config::get_auto_password(PASSWORD_LENGTH);
+fn initialize_password() -> bool {
+    let password = derive_machine_password();
     if Config::set_permanent_password(&password) {
         Config::set_option(
             OPTION_VERIFICATION_METHOD.to_owned(),
@@ -366,14 +360,27 @@ fn rotate_password() -> bool {
         );
         match CURRENT_PASSWORD.write() {
             Ok(mut current) => *current = password.clone(),
-            Err(err) => log::error!("Failed to cache rotated password: {err}"),
+            Err(err) => log::error!("Failed to cache internal API password: {err}"),
         }
-        log::info!("Permanent password rotated by internal ability API: {password}");
+        log::info!("Permanent password initialized by internal ability API");
         true
     } else {
-        log::warn!("Permanent password rotation was rejected by configuration");
+        log::warn!("Permanent password initialization was rejected by configuration");
         false
     }
+}
+
+fn derive_machine_password() -> String {
+    let secret_key = Config::get_key_pair().0;
+    let mut hasher = Sha256::new();
+    hasher.update(b"rustdesk-internal-api-password-v1");
+    hasher.update(secret_key);
+    hasher
+        .finalize()
+        .iter()
+        .take(PASSWORD_LENGTH)
+        .map(|byte| PASSWORD_CHARS[*byte as usize % PASSWORD_CHARS.len()] as char)
+        .collect()
 }
 
 fn account_data(status: &str) -> AccountData {
