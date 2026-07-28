@@ -1,8 +1,8 @@
 use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Once, RwLock,
+        RwLock,
     },
     time::Duration,
 };
@@ -10,7 +10,6 @@ use std::{
 use axum::{
     extract::{Json, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -18,7 +17,6 @@ use hbb_common::{
     anyhow::{anyhow, Result},
     config::{self, keys::*, Config},
     log,
-    sha2::{Digest, Sha256},
     tokio::{
         net::TcpListener,
         select,
@@ -26,21 +24,19 @@ use hbb_common::{
         time,
     },
 };
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
+// --service ------------------------------------------------------------------
+// Owns Axum, registration, reporting, the plaintext password and its rotation.
 const LISTEN_PORT: u16 = 3000;
 const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const REGISTER_INTERVAL_SECS: u64 = 30;
+const PASSWORD_ROTATE_SECS: u64 = 5 * 60;
 const PASSWORD_LENGTH: usize = 10;
-const PASSWORD_CHARS: &[u8] = b"abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const BUSINESS: &str = "rustdesk";
-const IOTHUB_CLIENT: &str = "http://localhost:35000";
-const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
-const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
-const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
+const REGISTER_ENDPOINT: &str = "http://localhost:35000/register";
+const ABILITY_ACK_ENDPOINT: &str = "http://localhost:35000/ability_ack";
 
-static START: Once = Once::new();
 static ABILITY_STARTED: AtomicBool = AtomicBool::new(false);
 
 lazy_static::lazy_static! {
@@ -56,136 +52,16 @@ enum AbilityAckEvent {
     Stop,
 }
 
-#[derive(Debug, Serialize)]
-struct AccountData {
-    #[serde(rename = "rdID")]
-    rd_id: String,
-    #[serde(rename = "rdPwd")]
-    rd_pwd: String,
-    #[serde(rename = "snMac")]
-    sn_mac: String,
-    #[serde(rename = "rdStatus")]
-    rd_status: String,
-    #[serde(rename = "userNum")]
-    user_num: i64,
-    ts: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Root<T> {
-    bid: String,
-    tid: String,
-    ts: i64,
-    data: T,
-}
-
-#[derive(Debug, Deserialize)]
-struct AbilityData {
-    r#type: String,
-    action: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct AbilityAckData {
-    r#type: String,
-    action: String,
-    result: AccountData,
-}
-
-struct HandlerError(hbb_common::anyhow::Error);
-
-impl<E> From<E> for HandlerError
-where
-    E: Into<hbb_common::anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        Self(err.into())
-    }
-}
-
-impl IntoResponse for HandlerError {
-    fn into_response(self) -> Response {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "error": self.0.to_string(),
-            })),
-        )
-            .into_response()
-    }
-}
+type HttpError = (StatusCode, Json<Value>);
 
 pub fn start() {
-    START.call_once(|| {
-        apply_startup_config();
-        set_hostname_id();
-        hbb_common::tokio::spawn(async {
-            initialize_password();
-            run().await;
-        });
+    hbb_common::tokio::spawn(async {
+        run().await;
     });
 }
 
-fn apply_startup_config() {
-    let before = (
-        Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER),
-        Config::get_option(OPTION_API_SERVER),
-        Config::get_option(OPTION_RELAY_SERVER),
-        Config::get_option(OPTION_KEY),
-        Config::get_option(OPTION_DIRECT_SERVER),
-        Config::get_option(OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
-        Config::get_option(OPTION_ALLOW_LINUX_HEADLESS),
-    );
-
-    {
-        let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
-        defaults
-            .entry(OPTION_DIRECT_SERVER.to_owned())
-            .or_insert_with(|| "Y".to_owned());
-        defaults
-            .entry(OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned())
-            .or_insert_with(|| "Y".to_owned());
-        defaults
-            .entry(OPTION_ALLOW_LINUX_HEADLESS.to_owned())
-            .or_insert_with(|| "Y".to_owned());
-    }
-    config::BUILTIN_SETTINGS
-        .write()
-        .unwrap()
-        .insert(OPTION_REGISTER_DEVICE.to_owned(), "N".to_owned());
-
-    Config::set_option(
-        OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
-        ID_SERVER.to_owned(),
-    );
-    Config::set_option(OPTION_API_SERVER.to_owned(), String::new());
-    Config::set_option(OPTION_RELAY_SERVER.to_owned(), RELAY_SERVER.to_owned());
-    Config::set_option(OPTION_KEY.to_owned(), SERVER_KEY.to_owned());
-    Config::set_option(OPTION_DIRECT_SERVER.to_owned(), "Y".to_owned());
-    Config::set_option(
-        OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
-        "Y".to_owned(),
-    );
-    Config::set_option(OPTION_ALLOW_LINUX_HEADLESS.to_owned(), "Y".to_owned());
-
-    let after = (
-        Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER),
-        Config::get_option(OPTION_API_SERVER),
-        Config::get_option(OPTION_RELAY_SERVER),
-        Config::get_option(OPTION_KEY),
-        Config::get_option(OPTION_DIRECT_SERVER),
-        Config::get_option(OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
-        Config::get_option(OPTION_ALLOW_LINUX_HEADLESS),
-    );
-    if before != after {
-        crate::RendezvousMediator::restart();
-    }
-}
-
 async fn run() {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), LISTEN_PORT);
+    let addr = SocketAddr::from(([0, 0, 0, 0], LISTEN_PORT));
     let (ability_ack_tx, ability_ack_rx) = mpsc::channel(16);
     let app = Router::new()
         .route("/ability", post(ability))
@@ -195,7 +71,7 @@ async fn run() {
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("Internal ability API listening on http://{addr}");
-            start_registration(LISTEN_PORT);
+            start_registration();
             hbb_common::tokio::spawn(ability_ack_worker(ability_ack_rx));
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
@@ -207,22 +83,21 @@ async fn run() {
     }
 }
 
-fn start_registration(port: u16) {
-    hbb_common::tokio::spawn(async move {
+fn start_registration() {
+    hbb_common::tokio::spawn(async {
         let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
             return;
         };
-        let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/register");
         let payload = json!({
             "business": BUSINESS,
-            "port": port,
+            "port": LISTEN_PORT,
         });
         let mut ticker = time::interval(Duration::from_secs(REGISTER_INTERVAL_SECS));
 
         loop {
             ticker.tick().await;
             if let Err(err) = client
-                .post(&endpoint)
+                .post(REGISTER_ENDPOINT)
                 .json(&payload)
                 .send()
                 .await
@@ -234,32 +109,37 @@ fn start_registration(port: u16) {
     });
 }
 
-// Functional handlers.
 async fn ability(
     State(ability_ack_tx): State<Sender<AbilityAckEvent>>,
-    Json(root): Json<Root<AbilityData>>,
-) -> Result<StatusCode, HandlerError> {
-    if root.data.r#type != BUSINESS {
-        return Err(anyhow!("未知的 type: {}", root.data.r#type).into());
+    Json(body): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    let ability_type = body
+        .pointer("/data/type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request("缺少 type 参数"))?;
+    if ability_type != BUSINESS {
+        return Err(bad_request(format!("未知的 type: {ability_type}")));
     }
-    let action = root
-        .data
-        .action
-        .ok_or_else(|| anyhow!("缺少 action 参数"))?;
-    match action.as_str() {
+    let action = body
+        .pointer("/data/action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad_request("缺少 action 参数"))?;
+    match action {
         "start" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Start).await,
         "stop" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Stop).await,
-        _ => return Err(anyhow!("未知的 action: {}", action).into()),
+        _ => {}
     }
 
     Ok(StatusCode::OK)
 }
 
-async fn account() -> Json<AccountData> {
-    Json(account_data("running"))
+async fn account() -> Result<Json<Value>, HttpError> {
+    account_data("running")
+        .await
+        .map(Json)
+        .map_err(|err| bad_request(err.to_string()))
 }
 
-// Reporting helpers.
 async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent) {
     if tx.send(event).await.is_err() {
         log::warn!("Failed to queue ability ack because the worker stopped");
@@ -269,9 +149,11 @@ async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent)
 async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
     let now = time::Instant::now();
     let alive_connection_interval = Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS);
+    let password_interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
     let mut alive_connection_ticker =
         time::interval_at(now + alive_connection_interval, alive_connection_interval);
-    let mut last_alive_connection_count = crate::server::alive_connection_count();
+    let mut password_ticker = time::interval_at(now + password_interval, password_interval);
+    let mut last_alive_connection_count = None;
 
     loop {
         select! {
@@ -291,12 +173,32 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                 }
             }
             _ = alive_connection_ticker.tick() => {
-                let current = crate::server::alive_connection_count();
-                if current != last_alive_connection_count {
-                    last_alive_connection_count = current;
-                    if ABILITY_STARTED.load(Ordering::Relaxed) {
+                if current_password().is_empty() {
+                    if let Err(err) = rotate_password().await {
+                        log::warn!("Failed to initialize internal API password: {err}");
+                        continue;
+                    }
+                }
+                match account_data("running").await {
+                    Ok(result) => {
+                        let current = result["userNum"].as_i64().unwrap_or_default();
+                        let changed = last_alive_connection_count
+                            .map_or(true, |last| last != current);
+                        last_alive_connection_count = Some(current);
+                        if changed && ABILITY_STARTED.load(Ordering::Relaxed) {
+                            send_ability_ack_with_result("start", result).await;
+                        }
+                    }
+                    Err(err) => log::warn!("Failed to query current server account data: {err}"),
+                }
+            }
+            _ = password_ticker.tick() => {
+                match rotate_password().await {
+                    Ok(()) if ABILITY_STARTED.load(Ordering::Relaxed) => {
                         send_ability_ack("start", "running").await;
                     }
+                    Ok(()) => {}
+                    Err(err) => log::warn!("Failed to rotate internal API password: {err}"),
                 }
             }
         }
@@ -304,23 +206,29 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
 }
 
 async fn send_ability_ack(action: &str, status: &str) {
+    match account_data(status).await {
+        Ok(result) => send_ability_ack_with_result(action, result).await,
+        Err(err) => log::warn!("Failed to query current server for ability {action} ack: {err}"),
+    }
+}
+
+async fn send_ability_ack_with_result(action: &str, result: Value) {
     let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
         return;
     };
-    let endpoint = format!("{}{}", IOTHUB_CLIENT.trim_end_matches('/'), "/ability_ack");
-    let root = Root {
-        bid: uuid::Uuid::new_v4().to_string(),
-        tid: uuid::Uuid::new_v4().to_string(),
-        ts: chrono::Utc::now().timestamp_millis(),
-        data: AbilityAckData {
-            r#type: BUSINESS.to_owned(),
-            action: action.to_owned(),
-            result: account_data(status),
+    let body = json!({
+        "bid": uuid::Uuid::new_v4().to_string(),
+        "tid": uuid::Uuid::new_v4().to_string(),
+        "ts": chrono::Utc::now().timestamp_millis(),
+        "data": {
+            "type": BUSINESS,
+            "action": action,
+            "result": result,
         },
-    };
+    });
     if let Err(err) = client
-        .post(&endpoint)
-        .json(&root)
+        .post(ABILITY_ACK_ENDPOINT)
+        .json(&body)
         .send()
         .await
         .and_then(|response| response.error_for_status())
@@ -329,7 +237,118 @@ async fn send_ability_ack(action: &str, status: &str) {
     }
 }
 
-// Local identity and password helpers.
+async fn rotate_password() -> Result<()> {
+    let password = Config::get_auto_password(PASSWORD_LENGTH);
+    crate::ipc::set_internal_api_password(password.clone()).await?;
+    *CURRENT_PASSWORD
+        .write()
+        .map_err(|err| anyhow!("Failed to cache internal API password: {err}"))? = password;
+    log::info!("Internal API password rotated");
+    Ok(())
+}
+
+fn current_password() -> String {
+    CURRENT_PASSWORD
+        .read()
+        .map(|password| password.clone())
+        .unwrap_or_default()
+}
+
+async fn account_data(status: &str) -> Result<Value> {
+    let (rd_id, user_num) = crate::ipc::get_internal_api_account().await?;
+    let rd_pwd = current_password();
+    if rd_pwd.is_empty() {
+        return Err(anyhow!("Internal API password is not initialized"));
+    }
+
+    Ok(json!({
+        "rdID": rd_id,
+        "rdPwd": rd_pwd,
+        "snMac": "",
+        "rdStatus": status,
+        "ts": chrono::Utc::now().timestamp_millis(),
+        "userNum": user_num,
+    }))
+}
+
+// --server -------------------------------------------------------------------
+// Owns RustDesk configuration, identity, password storage and live connections.
+const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
+const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
+const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
+
+static SERVER_READY: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn initialize_server() {
+    apply_startup_config();
+    set_hostname_id();
+    Config::set_option(
+        OPTION_VERIFICATION_METHOD.to_owned(),
+        "use-permanent-password".to_owned(),
+    );
+    SERVER_READY.store(true, Ordering::Release);
+}
+
+pub(crate) fn server_account() -> Option<(String, usize)> {
+    SERVER_READY
+        .load(Ordering::Acquire)
+        .then(|| (Config::get_id(), crate::server::alive_connection_count()))
+}
+
+fn apply_startup_config() {
+    let before = (
+        Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER),
+        Config::get_option(OPTION_API_SERVER),
+        Config::get_option(OPTION_RELAY_SERVER),
+        Config::get_option(OPTION_KEY),
+        Config::get_option(OPTION_DIRECT_SERVER),
+        Config::get_option(OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
+        Config::get_option(OPTION_ALLOW_LINUX_HEADLESS),
+    );
+
+    {
+        let mut defaults = config::DEFAULT_SETTINGS.write().unwrap();
+        for key in [
+            OPTION_DIRECT_SERVER,
+            OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION,
+            OPTION_ALLOW_LINUX_HEADLESS,
+        ] {
+            defaults
+                .entry(key.to_owned())
+                .or_insert_with(|| "Y".to_owned());
+        }
+    }
+    config::BUILTIN_SETTINGS
+        .write()
+        .unwrap()
+        .insert(OPTION_REGISTER_DEVICE.to_owned(), "N".to_owned());
+
+    for (key, value) in [
+        (OPTION_CUSTOM_RENDEZVOUS_SERVER, ID_SERVER),
+        (OPTION_API_SERVER, ""),
+        (OPTION_RELAY_SERVER, RELAY_SERVER),
+        (OPTION_KEY, SERVER_KEY),
+        (OPTION_DIRECT_SERVER, "Y"),
+        (OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION, "Y"),
+        (OPTION_ALLOW_LINUX_HEADLESS, "Y"),
+    ] {
+        Config::set_option(key.to_owned(), value.to_owned());
+    }
+
+    let after = (
+        Config::get_option(OPTION_CUSTOM_RENDEZVOUS_SERVER),
+        Config::get_option(OPTION_API_SERVER),
+        Config::get_option(OPTION_RELAY_SERVER),
+        Config::get_option(OPTION_KEY),
+        Config::get_option(OPTION_DIRECT_SERVER),
+        Config::get_option(OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
+        Config::get_option(OPTION_ALLOW_LINUX_HEADLESS),
+    );
+    if before != after {
+        crate::RendezvousMediator::restart();
+    }
+}
+
 fn set_hostname_id() {
     Config::set_key_confirmed(false);
     if let Some(id) = sanitized_hostname() {
@@ -349,50 +368,4 @@ fn sanitized_hostname() -> Option<String> {
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         .collect::<String>();
     (!id.is_empty()).then_some(id)
-}
-
-fn initialize_password() -> bool {
-    let password = derive_machine_password();
-    if Config::set_permanent_password(&password) {
-        Config::set_option(
-            OPTION_VERIFICATION_METHOD.to_owned(),
-            "use-permanent-password".to_owned(),
-        );
-        match CURRENT_PASSWORD.write() {
-            Ok(mut current) => *current = password.clone(),
-            Err(err) => log::error!("Failed to cache internal API password: {err}"),
-        }
-        log::info!("Permanent password initialized by internal ability API");
-        true
-    } else {
-        log::warn!("Permanent password initialization was rejected by configuration");
-        false
-    }
-}
-
-fn derive_machine_password() -> String {
-    let secret_key = Config::get_key_pair().0;
-    let mut hasher = Sha256::new();
-    hasher.update(b"rustdesk-internal-api-password-v1");
-    hasher.update(secret_key);
-    hasher
-        .finalize()
-        .iter()
-        .take(PASSWORD_LENGTH)
-        .map(|byte| PASSWORD_CHARS[*byte as usize % PASSWORD_CHARS.len()] as char)
-        .collect()
-}
-
-fn account_data(status: &str) -> AccountData {
-    AccountData {
-        rd_id: Config::get_id(),
-        rd_pwd: CURRENT_PASSWORD
-            .read()
-            .map(|v| v.clone())
-            .unwrap_or_default(),
-        sn_mac: "".to_owned(),
-        rd_status: status.to_owned(),
-        ts: chrono::Utc::now().timestamp_millis(),
-        user_num: crate::server::alive_connection_count() as i64,
-    }
 }

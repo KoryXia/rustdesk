@@ -471,6 +471,8 @@ pub enum Data {
     ControllingSessionCount(usize),
     #[cfg(target_os = "linux")]
     TerminalSessionCount(usize),
+    #[cfg(target_os = "linux")]
+    InternalApiAccount(Option<(String, usize)>),
     #[cfg(target_os = "windows")]
     PortForwardSessionCount(Option<usize>),
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
@@ -486,6 +488,10 @@ pub enum Data {
 #[tokio::main(flavor = "current_thread")]
 pub async fn start(postfix: &str) -> ResultType<()> {
     let mut incoming = new_listener(postfix).await?;
+    #[cfg(target_os = "linux")]
+    if postfix == crate::POSTFIX_SERVICE {
+        crate::internal_api::start();
+    }
     loop {
         if let Some(result) = incoming.next().await {
             match result {
@@ -1032,6 +1038,18 @@ async fn handle(data: Data, stream: &mut Connection) {
             let count = crate::terminal_service::get_terminal_session_count(true);
             allow_err!(stream.send(&Data::TerminalSessionCount(count)).await);
         }
+        #[cfg(target_os = "linux")]
+        Data::InternalApiAccount(None) => {
+            allow_err!(
+                stream
+                    .send(&Data::InternalApiAccount(
+                        crate::internal_api::server_account()
+                    ))
+                    .await
+            );
+        }
+        #[cfg(target_os = "linux")]
+        Data::InternalApiAccount(Some(_)) => {}
         #[cfg(feature = "hwcodec")]
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         Data::CheckHwcodec => {
@@ -1369,6 +1387,41 @@ pub async fn connect_for_uid(
         bail!("Rejected user IPC peer for uid {}", uid);
     }
     Ok(conn)
+}
+
+#[cfg(target_os = "linux")]
+pub async fn get_internal_api_account() -> ResultType<(String, usize)> {
+    let timeout_ms = 1_000;
+    let uid = user_main_ipc_server_uid()?;
+    let mut conn = connect_for_uid(timeout_ms, uid, "").await?;
+    conn.send(&Data::InternalApiAccount(None)).await?;
+    match conn.next_timeout(timeout_ms).await? {
+        Some(Data::InternalApiAccount(Some(account))) => Ok(account),
+        _ => bail!("Invalid internal API account response from current server"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub async fn set_internal_api_password(password: String) -> ResultType<()> {
+    let timeout_ms = 1_000;
+    let name = "permanent-password";
+    let uid = user_main_ipc_server_uid()?;
+    let mut conn = connect_for_uid(timeout_ms, uid, "").await?;
+    conn.send(&Data::Config((name.to_owned(), Some(password))))
+        .await?;
+    match conn.next_timeout(timeout_ms).await? {
+        Some(Data::Config((response_name, Some(ack))))
+            if response_name == name && ack == "Y" =>
+        {
+            Ok(())
+        }
+        Some(Data::Config((response_name, Some(ack))))
+            if response_name == name && ack == "N" =>
+        {
+            bail!("Current server rejected internal API password")
+        }
+        _ => bail!("Invalid internal API password response from current server"),
+    }
 }
 
 #[cfg(target_os = "linux")]
