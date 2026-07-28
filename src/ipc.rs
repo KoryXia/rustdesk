@@ -472,7 +472,7 @@ pub enum Data {
     #[cfg(target_os = "linux")]
     TerminalSessionCount(usize),
     #[cfg(target_os = "linux")]
-    InternalApiAccount(Option<(String, usize)>),
+    InternalApiAccount(Option<(String, String, usize)>),
     #[cfg(target_os = "windows")]
     PortForwardSessionCount(Option<usize>),
     SocksWs(Option<Box<(Option<config::Socks5Server>, String)>>),
@@ -1390,7 +1390,7 @@ pub async fn connect_for_uid(
 }
 
 #[cfg(target_os = "linux")]
-pub async fn get_internal_api_account() -> ResultType<(String, usize)> {
+pub async fn get_internal_api_account() -> ResultType<(String, String, usize)> {
     let timeout_ms = 1_000;
     let uid = user_main_ipc_server_uid()?;
     let mut conn = connect_for_uid(timeout_ms, uid, "").await?;
@@ -1398,29 +1398,6 @@ pub async fn get_internal_api_account() -> ResultType<(String, usize)> {
     match conn.next_timeout(timeout_ms).await? {
         Some(Data::InternalApiAccount(Some(account))) => Ok(account),
         _ => bail!("Invalid internal API account response from current server"),
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub async fn set_internal_api_password(password: String) -> ResultType<()> {
-    let timeout_ms = 1_000;
-    let name = "permanent-password";
-    let uid = user_main_ipc_server_uid()?;
-    let mut conn = connect_for_uid(timeout_ms, uid, "").await?;
-    conn.send(&Data::Config((name.to_owned(), Some(password))))
-        .await?;
-    match conn.next_timeout(timeout_ms).await? {
-        Some(Data::Config((response_name, Some(ack))))
-            if response_name == name && ack == "Y" =>
-        {
-            Ok(())
-        }
-        Some(Data::Config((response_name, Some(ack))))
-            if response_name == name && ack == "N" =>
-        {
-            bail!("Current server rejected internal API password")
-        }
-        _ => bail!("Invalid internal API password response from current server"),
     }
 }
 

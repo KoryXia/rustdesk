@@ -14,7 +14,7 @@ use axum::{
     Router,
 };
 use hbb_common::{
-    anyhow::{anyhow, Result},
+    anyhow::Result,
     config::{self, keys::*, Config},
     log,
     tokio::{
@@ -27,13 +27,11 @@ use hbb_common::{
 use serde_json::{json, Value};
 
 // --service ------------------------------------------------------------------
-// Owns Axum, registration, reporting, the plaintext password and its rotation.
+// Owns Axum, registration and reporting.
 const LISTEN_PORT: u16 = 3000;
 const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
 const ZERO_CONNECTION_DISABLE_SECS: u64 = 3 * 60;
 const REGISTER_INTERVAL_SECS: u64 = 30;
-const PASSWORD_ROTATE_SECS: u64 = 5 * 60;
-const PASSWORD_LENGTH: usize = 10;
 const BUSINESS: &str = "rustdesk";
 const REGISTER_ENDPOINT: &str = "http://localhost:35000/register";
 const ABILITY_ACK_ENDPOINT: &str = "http://localhost:35000/ability_ack";
@@ -41,7 +39,6 @@ const ABILITY_ACK_ENDPOINT: &str = "http://localhost:35000/ability_ack";
 static ABILITY_STARTED: AtomicBool = AtomicBool::new(false);
 
 lazy_static::lazy_static! {
-    static ref CURRENT_PASSWORD: RwLock<String> = RwLock::new(String::new());
     static ref ABILITY_ACK_CLIENT: Option<reqwest::Client> = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -140,14 +137,12 @@ async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent)
 }
 
 async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
-    let now = time::Instant::now();
-    let alive_connection_interval = Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS);
-    let password_interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
     let mut alive_connection_ticker =
-        time::interval_at(now + alive_connection_interval, alive_connection_interval);
-    let mut password_ticker = time::interval_at(now + password_interval, password_interval);
+        time::interval(Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS));
     let mut last_alive_connection_count = None;
+    let mut last_password = None;
     let mut zero_connection_since = None;
+    let mut start_report_pending = false;
 
     loop {
         select! {
@@ -159,74 +154,68 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                     AbilityAckEvent::Start => {
                         zero_connection_since = None;
                         ABILITY_STARTED.store(true, Ordering::Relaxed);
-                        send_ability_ack("start", "running").await;
+                        start_report_pending = !send_ability_ack("start", "running").await;
                     }
                     AbilityAckEvent::Stop => {
                         zero_connection_since = None;
+                        start_report_pending = false;
                         ABILITY_STARTED.store(false, Ordering::Relaxed);
                         send_ability_ack("stop", "stopped").await;
                     }
                 }
             }
             _ = alive_connection_ticker.tick() => {
-                let password_initialized = current_password().is_empty();
-                if password_initialized {
-                    if let Err(err) = rotate_password().await {
-                        log::warn!("Failed to initialize internal API password: {err}");
-                        continue;
-                    }
-                }
                 match account_data("running").await {
                     Ok(mut result) => {
                         let current = result["userNum"].as_i64().unwrap_or_default();
+                        let password = result["rdPwd"].as_str().unwrap_or_default().to_owned();
                         let changed = last_alive_connection_count
-                            .map_or(true, |last| last != current);
+                            .map_or(true, |last| last != current)
+                            || last_password.as_ref() != Some(&password);
                         last_alive_connection_count = Some(current);
+                        last_password = Some(password);
                         if !ABILITY_STARTED.load(Ordering::Relaxed) {
                             zero_connection_since = None;
                         } else if current == 0 {
-                            if password_initialized {
+                            let zero_since =
+                                zero_connection_since.get_or_insert_with(time::Instant::now);
+                            if zero_since.elapsed()
+                                >= Duration::from_secs(ZERO_CONNECTION_DISABLE_SECS)
+                            {
+                                result["rdStatus"] = json!("stopped");
+                                send_ability_ack_with_result("stop", result).await;
+                                ABILITY_STARTED.store(false, Ordering::Relaxed);
+                                zero_connection_since = None;
+                                start_report_pending = false;
+                            } else if start_report_pending || changed {
                                 send_ability_ack_with_result("start", result).await;
-                                zero_connection_since = Some(time::Instant::now());
-                            } else {
-                                let zero_since =
-                                    zero_connection_since.get_or_insert_with(time::Instant::now);
-                                if zero_since.elapsed()
-                                    >= Duration::from_secs(ZERO_CONNECTION_DISABLE_SECS)
-                                {
-                                    result["rdStatus"] = json!("stopped");
-                                    send_ability_ack_with_result("stop", result).await;
-                                    ABILITY_STARTED.store(false, Ordering::Relaxed);
-                                    zero_connection_since = None;
-                                }
+                                start_report_pending = false;
                             }
                         } else {
                             zero_connection_since = None;
-                            if password_initialized || changed {
+                            if start_report_pending || changed {
                                 send_ability_ack_with_result("start", result).await;
+                                start_report_pending = false;
                             }
                         }
                     }
                     Err(err) => log::warn!("Failed to query current server account data: {err}"),
                 }
             }
-            _ = password_ticker.tick() => {
-                match rotate_password().await {
-                    Ok(()) if ABILITY_STARTED.load(Ordering::Relaxed) => {
-                        send_ability_ack("start", "running").await;
-                    }
-                    Ok(()) => {}
-                    Err(err) => log::warn!("Failed to rotate internal API password: {err}"),
-                }
-            }
         }
     }
 }
 
-async fn send_ability_ack(action: &str, status: &str) {
+async fn send_ability_ack(action: &str, status: &str) -> bool {
     match account_data(status).await {
-        Ok(result) => send_ability_ack_with_result(action, result).await,
-        Err(err) => log::warn!("Failed to query current server for ability {action} ack: {err}"),
+        Ok(result) => {
+            send_ability_ack_with_result(action, result).await;
+            true
+        }
+        Err(err) => {
+            log::warn!("Failed to query current server for ability {action} ack: {err}");
+            false
+        }
     }
 }
 
@@ -255,29 +244,8 @@ async fn send_ability_ack_with_result(action: &str, result: Value) {
     }
 }
 
-async fn rotate_password() -> Result<()> {
-    let password = Config::get_auto_password(PASSWORD_LENGTH);
-    crate::ipc::set_internal_api_password(password.clone()).await?;
-    *CURRENT_PASSWORD
-        .write()
-        .map_err(|err| anyhow!("Failed to cache internal API password: {err}"))? = password;
-    log::info!("Internal API password rotated");
-    Ok(())
-}
-
-fn current_password() -> String {
-    CURRENT_PASSWORD
-        .read()
-        .map(|password| password.clone())
-        .unwrap_or_default()
-}
-
 async fn account_data(status: &str) -> Result<Value> {
-    let (rd_id, user_num) = crate::ipc::get_internal_api_account().await?;
-    let rd_pwd = current_password();
-    if rd_pwd.is_empty() {
-        return Err(anyhow!("Internal API password is not initialized"));
-    }
+    let (rd_id, rd_pwd, user_num) = crate::ipc::get_internal_api_account().await?;
 
     Ok(json!({
         "rdID": rd_id,
@@ -291,11 +259,16 @@ async fn account_data(status: &str) -> Result<Value> {
 
 // --server -------------------------------------------------------------------
 // Owns RustDesk configuration, identity, password storage and live connections.
+const PASSWORD_ROTATE_SECS: u64 = 5 * 60;
+const PASSWORD_LENGTH: usize = 10;
 const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
 const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
 const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
 
 static SERVER_READY: AtomicBool = AtomicBool::new(false);
+lazy_static::lazy_static! {
+    static ref SERVER_PASSWORD: RwLock<String> = RwLock::new(String::new());
+}
 
 pub(crate) fn initialize_server() {
     apply_startup_config();
@@ -304,13 +277,68 @@ pub(crate) fn initialize_server() {
         OPTION_VERIFICATION_METHOD.to_owned(),
         "use-permanent-password".to_owned(),
     );
+    rotate_server_password();
     SERVER_READY.store(true, Ordering::Release);
+    hbb_common::tokio::spawn(async {
+        let interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
+        let mut ticker = time::interval_at(time::Instant::now() + interval, interval);
+        loop {
+            ticker.tick().await;
+            rotate_server_password();
+        }
+    });
 }
 
-pub(crate) fn server_account() -> Option<(String, usize)> {
-    SERVER_READY
-        .load(Ordering::Acquire)
-        .then(|| (Config::get_id(), crate::server::alive_connection_count()))
+pub(crate) fn server_account() -> Option<(String, String, usize)> {
+    if !SERVER_READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let password = match SERVER_PASSWORD.read() {
+        Ok(password) => password.clone(),
+        Err(err) => {
+            log::error!("Failed to read server password: {err}");
+            return None;
+        }
+    };
+    if password.is_empty() {
+        return None;
+    }
+    Some((
+        Config::get_id(),
+        password,
+        crate::server::alive_connection_count(),
+    ))
+}
+
+fn rotate_server_password() {
+    let password = Config::get_auto_password(PASSWORD_LENGTH);
+    if !Config::set_permanent_password(&password) {
+        log::warn!("Failed to rotate server password");
+        return;
+    }
+    match SERVER_PASSWORD.write() {
+        Ok(mut current) => {
+            *current = password;
+            log::info!("Server password rotated");
+        }
+        Err(err) => log::error!("Failed to cache server password: {err}"),
+    }
+}
+
+pub(crate) fn reapply_server_password() {
+    if !SERVER_READY.load(Ordering::Acquire) {
+        return;
+    }
+    let password = match SERVER_PASSWORD.read() {
+        Ok(password) => password.clone(),
+        Err(err) => {
+            log::error!("Failed to read server password after config sync: {err}");
+            return;
+        }
+    };
+    if !password.is_empty() && !Config::set_permanent_password(&password) {
+        log::warn!("Failed to reapply server password after config sync");
+    }
 }
 
 fn apply_startup_config() {

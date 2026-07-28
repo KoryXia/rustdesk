@@ -749,6 +749,8 @@ async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Se
                                         if cfg0.0 != config {
                                             cfg0.0 = config.clone();
                                             Config::set(config);
+                                            #[cfg(target_os = "linux")]
+                                            crate::internal_api::reapply_server_password();
                                             log::info!("sync config from root");
                                         }
                                         if cfg0.1 != config2 {
