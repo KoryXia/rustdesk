@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 // Owns Axum, registration, reporting, the plaintext password and its rotation.
 const LISTEN_PORT: u16 = 3000;
 const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
+const ZERO_CONNECTION_DISABLE_SECS: u64 = 3 * 60;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const PASSWORD_ROTATE_SECS: u64 = 5 * 60;
 const PASSWORD_LENGTH: usize = 10;
@@ -52,8 +53,6 @@ enum AbilityAckEvent {
     Stop,
 }
 
-type HttpError = (StatusCode, Json<Value>);
-
 pub fn start() {
     hbb_common::tokio::spawn(async {
         run().await;
@@ -61,7 +60,7 @@ pub fn start() {
 }
 
 async fn run() {
-    let addr = SocketAddr::from(([0, 0, 0, 0], LISTEN_PORT));
+    let addr = SocketAddr::from(([127, 0, 0, 1], LISTEN_PORT));
     let (ability_ack_tx, ability_ack_rx) = mpsc::channel(16);
     let app = Router::new()
         .route("/ability", post(ability))
@@ -112,32 +111,26 @@ fn start_registration() {
 async fn ability(
     State(ability_ack_tx): State<Sender<AbilityAckEvent>>,
     Json(body): Json<Value>,
-) -> Result<StatusCode, HttpError> {
-    let ability_type = body
-        .pointer("/data/type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| bad_request("缺少 type 参数"))?;
-    if ability_type != BUSINESS {
-        return Err(bad_request(format!("未知的 type: {ability_type}")));
+) -> StatusCode {
+    if body.pointer("/data/type").and_then(Value::as_str) != Some(BUSINESS) {
+        return StatusCode::OK;
     }
-    let action = body
-        .pointer("/data/action")
-        .and_then(Value::as_str)
-        .ok_or_else(|| bad_request("缺少 action 参数"))?;
-    match action {
-        "start" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Start).await,
-        "stop" => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Stop).await,
+    match body.pointer("/data/action").and_then(Value::as_str) {
+        Some("start") => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Start).await,
+        Some("stop") => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Stop).await,
         _ => {}
     }
 
-    Ok(StatusCode::OK)
+    StatusCode::OK
 }
 
-async fn account() -> Result<Json<Value>, HttpError> {
-    account_data("running")
-        .await
-        .map(Json)
-        .map_err(|err| bad_request(err.to_string()))
+async fn account() -> Json<Value> {
+    Json(account_data("running").await.unwrap_or_else(|err| {
+        json!({
+            "ok": false,
+            "error": err.to_string(),
+        })
+    }))
 }
 
 async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent) {
@@ -154,6 +147,7 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
         time::interval_at(now + alive_connection_interval, alive_connection_interval);
     let mut password_ticker = time::interval_at(now + password_interval, password_interval);
     let mut last_alive_connection_count = None;
+    let mut zero_connection_since = None;
 
     loop {
         select! {
@@ -163,30 +157,54 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                 };
                 match event {
                     AbilityAckEvent::Start => {
+                        zero_connection_since = None;
                         ABILITY_STARTED.store(true, Ordering::Relaxed);
                         send_ability_ack("start", "running").await;
                     }
                     AbilityAckEvent::Stop => {
+                        zero_connection_since = None;
                         ABILITY_STARTED.store(false, Ordering::Relaxed);
                         send_ability_ack("stop", "stopped").await;
                     }
                 }
             }
             _ = alive_connection_ticker.tick() => {
-                if current_password().is_empty() {
+                let password_initialized = current_password().is_empty();
+                if password_initialized {
                     if let Err(err) = rotate_password().await {
                         log::warn!("Failed to initialize internal API password: {err}");
                         continue;
                     }
                 }
                 match account_data("running").await {
-                    Ok(result) => {
+                    Ok(mut result) => {
                         let current = result["userNum"].as_i64().unwrap_or_default();
                         let changed = last_alive_connection_count
                             .map_or(true, |last| last != current);
                         last_alive_connection_count = Some(current);
-                        if changed && ABILITY_STARTED.load(Ordering::Relaxed) {
-                            send_ability_ack_with_result("start", result).await;
+                        if !ABILITY_STARTED.load(Ordering::Relaxed) {
+                            zero_connection_since = None;
+                        } else if current == 0 {
+                            if password_initialized {
+                                send_ability_ack_with_result("start", result).await;
+                                zero_connection_since = Some(time::Instant::now());
+                            } else {
+                                let zero_since =
+                                    zero_connection_since.get_or_insert_with(time::Instant::now);
+                                if zero_since.elapsed()
+                                    >= Duration::from_secs(ZERO_CONNECTION_DISABLE_SECS)
+                                {
+                                    result["rdStatus"] = json!("stopped");
+                                    send_ability_ack_with_result("stop", result).await;
+                                    ABILITY_STARTED.store(false, Ordering::Relaxed);
+                                    zero_connection_since = None;
+                                }
+                            }
+                        } else {
+                            zero_connection_since = None;
+                            if password_initialized || changed {
+                                send_ability_ack_with_result("start", result).await;
+                            }
                         }
                     }
                     Err(err) => log::warn!("Failed to query current server account data: {err}"),
