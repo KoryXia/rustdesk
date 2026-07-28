@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 // --service ------------------------------------------------------------------
 // Owns Axum, registration and reporting.
 const LISTEN_PORT: u16 = 3000;
-const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 5;
-const ZERO_CONNECTION_DISABLE_SECS: u64 = 3 * 60;
+const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 10;
+const ZERO_CONNECTION_DISABLE_SECS: u64 = 60;
 const REGISTER_INTERVAL_SECS: u64 = 30;
 const BUSINESS: &str = "rustdesk";
 const REGISTER_ENDPOINT: &str = "http://localhost:35000/register";
@@ -139,10 +139,7 @@ async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent)
 async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
     let mut alive_connection_ticker =
         time::interval(Duration::from_secs(ALIVE_CONN_POLL_INTERVAL_SECS));
-    let mut last_alive_connection_count = None;
-    let mut last_password = None;
     let mut zero_connection_since = None;
-    let mut start_report_pending = false;
 
     loop {
         select! {
@@ -154,29 +151,24 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                     AbilityAckEvent::Start => {
                         zero_connection_since = None;
                         ABILITY_STARTED.store(true, Ordering::Relaxed);
-                        start_report_pending = !send_ability_ack("start", "running").await;
+                        send_ability_ack("start", "running").await;
                     }
                     AbilityAckEvent::Stop => {
                         zero_connection_since = None;
-                        start_report_pending = false;
                         ABILITY_STARTED.store(false, Ordering::Relaxed);
                         send_ability_ack("stop", "stopped").await;
                     }
                 }
             }
             _ = alive_connection_ticker.tick() => {
+                if !ABILITY_STARTED.load(Ordering::Relaxed) {
+                    zero_connection_since = None;
+                    continue;
+                }
                 match account_data("running").await {
                     Ok(mut result) => {
                         let current = result["userNum"].as_i64().unwrap_or_default();
-                        let password = result["rdPwd"].as_str().unwrap_or_default().to_owned();
-                        let changed = last_alive_connection_count
-                            .map_or(true, |last| last != current)
-                            || last_password.as_ref() != Some(&password);
-                        last_alive_connection_count = Some(current);
-                        last_password = Some(password);
-                        if !ABILITY_STARTED.load(Ordering::Relaxed) {
-                            zero_connection_since = None;
-                        } else if current == 0 {
+                        if current == 0 {
                             let zero_since =
                                 zero_connection_since.get_or_insert_with(time::Instant::now);
                             if zero_since.elapsed()
@@ -186,17 +178,12 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                                 send_ability_ack_with_result("stop", result).await;
                                 ABILITY_STARTED.store(false, Ordering::Relaxed);
                                 zero_connection_since = None;
-                                start_report_pending = false;
-                            } else if start_report_pending || changed {
+                            } else {
                                 send_ability_ack_with_result("start", result).await;
-                                start_report_pending = false;
                             }
                         } else {
                             zero_connection_since = None;
-                            if start_report_pending || changed {
-                                send_ability_ack_with_result("start", result).await;
-                                start_report_pending = false;
-                            }
+                            send_ability_ack_with_result("start", result).await;
                         }
                     }
                     Err(err) => log::warn!("Failed to query current server account data: {err}"),
@@ -206,16 +193,10 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
     }
 }
 
-async fn send_ability_ack(action: &str, status: &str) -> bool {
+async fn send_ability_ack(action: &str, status: &str) {
     match account_data(status).await {
-        Ok(result) => {
-            send_ability_ack_with_result(action, result).await;
-            true
-        }
-        Err(err) => {
-            log::warn!("Failed to query current server for ability {action} ack: {err}");
-            false
-        }
+        Ok(result) => send_ability_ack_with_result(action, result).await,
+        Err(err) => log::warn!("Failed to query current server for ability {action} ack: {err}"),
     }
 }
 

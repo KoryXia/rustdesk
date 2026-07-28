@@ -72,6 +72,8 @@ use std::{
     collections::HashMap,
     sync::atomic::{AtomicBool, Ordering},
 };
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU32;
 
 // IPC actions here.
 pub const IPC_ACTION_CLOSE: &str = "close";
@@ -1390,15 +1392,35 @@ pub async fn connect_for_uid(
 }
 
 #[cfg(target_os = "linux")]
-pub async fn get_internal_api_account() -> ResultType<(String, String, usize)> {
+const UNKNOWN_INTERNAL_API_SERVER_UID: u32 = u32::MAX;
+#[cfg(target_os = "linux")]
+static INTERNAL_API_SERVER_UID: AtomicU32 = AtomicU32::new(UNKNOWN_INTERNAL_API_SERVER_UID);
+
+#[cfg(target_os = "linux")]
+async fn get_internal_api_account_for_uid(uid: u32) -> ResultType<(String, String, usize)> {
     let timeout_ms = 1_000;
-    let uid = user_main_ipc_server_uid()?;
     let mut conn = connect_for_uid(timeout_ms, uid, "").await?;
     conn.send(&Data::InternalApiAccount(None)).await?;
     match conn.next_timeout(timeout_ms).await? {
         Some(Data::InternalApiAccount(Some(account))) => Ok(account),
         _ => bail!("Invalid internal API account response from current server"),
     }
+}
+
+#[cfg(target_os = "linux")]
+pub async fn get_internal_api_account() -> ResultType<(String, String, usize)> {
+    let cached_uid = INTERNAL_API_SERVER_UID.load(Ordering::Relaxed);
+    if cached_uid != UNKNOWN_INTERNAL_API_SERVER_UID {
+        if let Ok(account) = get_internal_api_account_for_uid(cached_uid).await {
+            return Ok(account);
+        }
+        INTERNAL_API_SERVER_UID.store(UNKNOWN_INTERNAL_API_SERVER_UID, Ordering::Relaxed);
+    }
+
+    let uid = user_main_ipc_server_uid()?;
+    let account = get_internal_api_account_for_uid(uid).await?;
+    INTERNAL_API_SERVER_UID.store(uid, Ordering::Relaxed);
+    Ok(account)
 }
 
 #[cfg(target_os = "linux")]
