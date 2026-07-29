@@ -17,6 +17,7 @@ use hbb_common::{
     anyhow::Result,
     config::{self, keys::*, Config},
     log,
+    sha2::{Digest, Sha256},
     tokio::{
         net::TcpListener,
         select,
@@ -240,7 +241,7 @@ async fn account_data(status: &str) -> Result<Value> {
 
 // --server -------------------------------------------------------------------
 // Owns RustDesk configuration, identity, password storage and live connections.
-const PASSWORD_ROTATE_SECS: u64 = 5 * 60;
+const PASSWORD_DATE_CHECK_SECS: u64 = 30;
 const PASSWORD_LENGTH: usize = 10;
 const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
 const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
@@ -258,14 +259,16 @@ pub(crate) fn initialize_server() {
         OPTION_VERIFICATION_METHOD.to_owned(),
         "use-permanent-password".to_owned(),
     );
-    rotate_server_password();
+    let mut password_date = set_daily_server_password();
     SERVER_READY.store(true, Ordering::Release);
-    hbb_common::tokio::spawn(async {
-        let interval = Duration::from_secs(PASSWORD_ROTATE_SECS);
+    hbb_common::tokio::spawn(async move {
+        let interval = Duration::from_secs(PASSWORD_DATE_CHECK_SECS);
         let mut ticker = time::interval_at(time::Instant::now() + interval, interval);
         loop {
             ticker.tick().await;
-            rotate_server_password();
+            if password_date.as_deref() != Some(&chrono::Local::now().date_naive().to_string()) {
+                password_date = set_daily_server_password();
+            }
         }
     });
 }
@@ -291,18 +294,29 @@ pub(crate) fn server_account() -> Option<(String, String, usize)> {
     ))
 }
 
-fn rotate_server_password() {
-    let password = Config::get_auto_password(PASSWORD_LENGTH);
+fn set_daily_server_password() -> Option<String> {
+    let date = chrono::Local::now().date_naive().to_string();
+    let source = format!("{date}:{}", Config::get_id());
+    let password = Sha256::digest(source.as_bytes())
+        .iter()
+        .take(PASSWORD_LENGTH / 2)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
     if !Config::set_permanent_password(&password) {
-        log::warn!("Failed to rotate server password");
-        return;
+        log::warn!("Failed to set daily server password");
+        return None;
     }
     match SERVER_PASSWORD.write() {
         Ok(mut current) => {
             *current = password;
-            log::info!("Server password rotated");
+            log::info!("Daily server password set for {date}");
+            Some(date)
         }
-        Err(err) => log::error!("Failed to cache server password: {err}"),
+        Err(err) => {
+            log::error!("Failed to cache server password: {err}");
+            None
+        }
     }
 }
 
