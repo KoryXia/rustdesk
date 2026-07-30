@@ -1,18 +1,11 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Once, RwLock},
-    time::Duration,
-};
+use std::{sync::Once, time::Duration};
 
-use axum::{extract::Json, routing::get, Router};
 use hbb_common::{
     config::{self, keys::*, Config},
     log,
-    tokio::{net::TcpListener, time},
+    tokio::time,
 };
-use serde::Serialize;
 
-const LISTEN_PORT: u16 = 3000;
 const PASSWORD_ROTATE_SECS: u64 = 10 * 60;
 const ID_SERVER: &str = env!("RUSTDESK_ID_SERVER");
 const RELAY_SERVER: &str = env!("RUSTDESK_RELAY_SERVER");
@@ -20,33 +13,12 @@ const SERVER_KEY: &str = env!("RUSTDESK_SERVER_KEY");
 
 static START: Once = Once::new();
 
-lazy_static::lazy_static! {
-    static ref CURRENT_PASSWORD: RwLock<String> = RwLock::new(String::new());
-}
-
-#[derive(Debug, Serialize)]
-struct AccountData {
-    #[serde(rename = "rdID")]
-    rd_id: String,
-    #[serde(rename = "rdPwd")]
-    rd_pwd: String,
-    #[serde(rename = "snMac")]
-    sn_mac: String,
-    #[serde(rename = "rdStatus")]
-    rd_status: String,
-    #[serde(rename = "userNum")]
-    user_num: i64,
-    ts: i64,
-}
-
 pub fn start() {
     START.call_once(|| {
         apply_startup_config();
         set_hostname_id();
         rotate_password();
-        hbb_common::tokio::spawn(async {
-            run().await;
-        });
+        hbb_common::tokio::spawn(password_rotation_loop());
     });
 }
 
@@ -106,33 +78,11 @@ fn apply_startup_config() {
     }
 }
 
-async fn run() {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), LISTEN_PORT);
-    let app = Router::new().route("/account", get(account));
-
-    match TcpListener::bind(addr).await {
-        Ok(listener) => {
-            log::info!("Internal API listening on http://{addr}");
-            hbb_common::tokio::spawn(password_rotation_loop());
-            if let Err(err) = axum::serve(listener, app).await {
-                log::error!("Internal API stopped: {err}");
-            }
-        }
-        Err(err) => {
-            log::error!("Failed to bind internal API on {addr}: {err}");
-        }
-    }
-}
-
 async fn password_rotation_loop() {
     loop {
         time::sleep(Duration::from_secs(PASSWORD_ROTATE_SECS)).await;
         rotate_password();
     }
-}
-
-async fn account() -> Json<AccountData> {
-    Json(account_data("running"))
 }
 
 fn set_hostname_id() {
@@ -161,32 +111,14 @@ fn sanitized_hostname() -> Option<String> {
 }
 
 fn rotate_password() {
-    let password = "Naviai@2024".to_owned();
-    if Config::set_permanent_password(&password) {
+    let password = "Naviai@2024";
+    if Config::set_permanent_password(password) {
         Config::set_option(
             OPTION_VERIFICATION_METHOD.to_owned(),
             "use-permanent-password".to_owned(),
         );
-        match CURRENT_PASSWORD.write() {
-            Ok(mut current) => *current = password.clone(),
-            Err(err) => log::error!("Failed to cache rotated password: {err}"),
-        }
-        log::info!("Permanent password set by internal API: {password}");
+        log::info!("Permanent password set");
     } else {
-        log::warn!("Permanent password rotation was rejected by configuration");
-    }
-}
-
-fn account_data(status: &str) -> AccountData {
-    AccountData {
-        rd_id: Config::get_id(),
-        rd_pwd: CURRENT_PASSWORD
-            .read()
-            .map(|v| v.clone())
-            .unwrap_or_default(),
-        sn_mac: "".to_owned(),
-        rd_status: status.to_owned(),
-        ts: chrono::Utc::now().timestamp_millis(),
-        user_num: crate::server::alive_connection_count() as i64,
+        log::warn!("Permanent password update was rejected by configuration");
     }
 }
