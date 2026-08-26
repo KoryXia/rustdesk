@@ -2,19 +2,14 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        RwLock,
+        Mutex, OnceLock, RwLock,
     },
     time::Duration,
 };
 
-use axum::{
-    extract::{Json, State},
-    http::StatusCode,
-    routing::{get, post},
-    Router,
-};
+use axum::{routing::get, Json, Router};
 use hbb_common::{
-    anyhow::Result,
+    anyhow::{Result, anyhow, bail},
     config::{self, keys::*, Config},
     log,
     sha2::{Digest, Sha256},
@@ -25,25 +20,156 @@ use hbb_common::{
         time,
     },
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
+use zenoh::handlers::FifoChannelHandler;
+use zenoh::pubsub::Subscriber;
+use zenoh::sample::Sample;
+
+// --zenoh --------------------------------------------------------------------
+// Interacts with iothub-client over the zenoh nc/v1 keyspace.
+const ABILITY_PREFIX: &str = "nc/v1/events/iothub_client/ability/rustdesk/";
+const ABILITY_ACK_PREFIX: &str = "nc/v1/events/iothub_client/ability_ack/rustdesk/";
+const DEFAULT_ZENOH_CONNECT: &str = "tcp/192.168.217.100:37447";
+
+static ZENOH_SESSION: OnceLock<zenoh::Session> = OnceLock::new();
+
+fn build_zenoh_config() -> zenoh::Config {
+    let mut config = zenoh::Config::default();
+    let _ = config.insert_json5("mode", "\"client\"");
+    let _ = config.insert_json5("scouting/multicast/enabled", "false");
+    let connect = std::env::var("ZENOH_CONNECT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_ZENOH_CONNECT.to_string());
+    let endpoints: Vec<&str> = connect
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Ok(json) = serde_json::to_string(&endpoints) {
+        if config.insert_json5("connect/endpoints", &json).is_err() {
+            log::warn!("Failed to set zenoh connect/endpoints");
+        }
+    }
+    config
+}
+
+async fn init_zenoh() -> Result<()> {
+    if ZENOH_SESSION.get().is_some() {
+        return Ok(());
+    }
+    let session = time::timeout(Duration::from_secs(5), zenoh::open(build_zenoh_config()))
+        .await
+        .map_err(|_| anyhow("open zenoh session timeout (5s)"))?
+        .map_err(|e| anyhow!("open zenoh session: {e}"))?;
+    ZENOH_SESSION
+        .set(session)
+        .map_err(|_| anyhow!("zenoh session already initialized"))
+}
+
+fn zenoh_session() -> Result<&'static zenoh::Session> {
+    ZENOH_SESSION
+        .get()
+        .ok_or_else(|| anyhow!("zenoh session not initialized"))
+}
+
+async fn publish(key: &str, payload: impl Into<String>) -> Result<()> {
+    zenoh_session()?
+        .put(key, payload.into())
+        .await
+        .map_err(|e| anyhow!("publish {key}: {e}"))
+}
+
+#[derive(Deserialize)]
+struct AbilityEnvelope {
+    ts: i64,
+    data: AbilityEnvelopeData,
+}
+
+#[derive(Deserialize)]
+struct AbilityEnvelopeData {
+    bid: Option<String>,
+    tid: Option<String>,
+    params: Option<Value>,
+}
+
+fn ability_action_from_key(key: &str) -> Option<String> {
+    let rest = key.strip_prefix(ABILITY_PREFIX)?;
+    let mut parts = rest.split('/');
+    let _type = parts.next()?;
+    parts.next().map(str::to_string).filter(|a| !a.is_empty())
+}
+
+async fn init_ability_subscriber() -> Result<()> {
+    let session = zenoh_session()?;
+    let subscriber: Subscriber<FifoChannelHandler<Sample>> = session
+        .declare_subscriber(format!("{ABILITY_PREFIX}**"))
+        .await
+        .map_err(|e| anyhow!("declare ability subscriber: {e}"))?;
+    log::info!("RustDesk subscribed to zenoh ability channel");
+    hbb_common::tokio::spawn(async move {
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let key = sample.key_expr().to_string();
+                    let payload = match sample.payload().try_to_string() {
+                        Ok(p) => p.to_string(),
+                        Err(e) => {
+                            log::warn!("Ability payload not UTF-8: key={key} err={e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = handle_ability(&key, &payload).await {
+                        log::warn!("Failed to handle zenoh ability message: key={key} err={e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Zenoh ability subscription closed: {e}");
+                    return;
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn handle_ability(key: &str, payload: &str) -> Result<()> {
+    let Some(action) = ability_action_from_key(key) else {
+        bail!("ability key missing action: {key}");
+    };
+    let envelope: AbilityEnvelope = serde_json::from_str(payload)
+        .map_err(|e| anyhow!("parse ability payload: {e}"))?;
+    set_ability_context(envelope.data.bid, envelope.data.tid);
+    match action.as_str() {
+        "start" => queue_ability_ack(AbilityAckEvent::Start).await,
+        "stop" => queue_ability_ack(AbilityAckEvent::Stop).await,
+        _ => bail!("ability unsupported action: {action}"),
+    }
+    Ok(())
+}
 
 // --service ------------------------------------------------------------------
-// Owns Axum, registration and reporting.
+// Owns the internal HTTP API (account query) and ability reporting.
 const LISTEN_PORT: u16 = 3000;
 const ALIVE_CONN_POLL_INTERVAL_SECS: u64 = 10;
 const ZERO_CONNECTION_DISABLE_SECS: u64 = 60;
-const REGISTER_INTERVAL_SECS: u64 = 30;
-const BUSINESS: &str = "rustdesk";
-const REGISTER_ENDPOINT: &str = "http://localhost:35000/register";
-const ABILITY_ACK_ENDPOINT: &str = "http://localhost:35000/ability_ack";
 
 static ABILITY_STARTED: AtomicBool = AtomicBool::new(false);
+static ABILITY_CONTEXT: Mutex<Option<(String, String)>> = Mutex::new(None);
+static ABILITY_ACK_TX: OnceLock<Sender<AbilityAckEvent>> = OnceLock::new();
 
-lazy_static::lazy_static! {
-    static ref ABILITY_ACK_CLIENT: Option<reqwest::Client> = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok();
+fn set_ability_context(bid: Option<String>, tid: Option<String>) {
+    if let (Some(bid), Some(tid), Ok(mut context)) = (bid, tid, ABILITY_CONTEXT.lock()) {
+        *context = Some((bid, tid));
+    }
+}
+
+fn ability_context() -> (Option<String>, Option<String>) {
+    match ABILITY_CONTEXT.lock().ok().and_then(|c| c.clone()) {
+        Some((bid, tid)) => (Some(bid), Some(tid)),
+        None => (None, None),
+    }
 }
 
 enum AbilityAckEvent {
@@ -58,17 +184,24 @@ pub fn start() {
 }
 
 async fn run() {
+    if let Err(e) = init_zenoh().await {
+        log::warn!("Zenoh init failed: {e}");
+        return;
+    }
+    if let Err(e) = init_ability_subscriber().await {
+        log::warn!("Ability subscriber init failed: {e}");
+        return;
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], LISTEN_PORT));
     let (ability_ack_tx, ability_ack_rx) = mpsc::channel(16);
-    let app = Router::new()
-        .route("/ability", post(ability))
-        .route("/account", get(account))
-        .with_state(ability_ack_tx);
+    if ABILITY_ACK_TX.set(ability_ack_tx).is_err() {
+        log::warn!("Ability ack channel already initialized");
+    }
+    let app = Router::new().route("/account", get(account));
 
     match TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("Internal ability API listening on http://{addr}");
-            start_registration();
             hbb_common::tokio::spawn(ability_ack_worker(ability_ack_rx));
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
@@ -80,48 +213,6 @@ async fn run() {
     }
 }
 
-fn start_registration() {
-    hbb_common::tokio::spawn(async {
-        let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
-            return;
-        };
-        let payload = json!({
-            "business": BUSINESS,
-            "port": LISTEN_PORT,
-        });
-        let mut ticker = time::interval(Duration::from_secs(REGISTER_INTERVAL_SECS));
-
-        loop {
-            ticker.tick().await;
-            if let Err(err) = client
-                .post(REGISTER_ENDPOINT)
-                .json(&payload)
-                .send()
-                .await
-                .and_then(|resp| resp.error_for_status())
-            {
-                log::warn!("Failed to register rustdesk service to iothub-client: {err}");
-            }
-        }
-    });
-}
-
-async fn ability(
-    State(ability_ack_tx): State<Sender<AbilityAckEvent>>,
-    Json(body): Json<Value>,
-) -> StatusCode {
-    if body.pointer("/data/type").and_then(Value::as_str) != Some(BUSINESS) {
-        return StatusCode::OK;
-    }
-    match body.pointer("/data/action").and_then(Value::as_str) {
-        Some("start") => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Start).await,
-        Some("stop") => queue_ability_ack(&ability_ack_tx, AbilityAckEvent::Stop).await,
-        _ => {}
-    }
-
-    StatusCode::OK
-}
-
 async fn account() -> Json<Value> {
     Json(account_data("running").await.unwrap_or_else(|err| {
         json!({
@@ -131,7 +222,11 @@ async fn account() -> Json<Value> {
     }))
 }
 
-async fn queue_ability_ack(tx: &Sender<AbilityAckEvent>, event: AbilityAckEvent) {
+async fn queue_ability_ack(event: AbilityAckEvent) {
+    let Some(tx) = ABILITY_ACK_TX.get() else {
+        log::warn!("Ability ack channel not initialized");
+        return;
+    };
     if tx.send(event).await.is_err() {
         log::warn!("Failed to queue ability ack because the worker stopped");
     }
@@ -202,27 +297,18 @@ async fn send_ability_ack(action: &str, status: &str) {
 }
 
 async fn send_ability_ack_with_result(action: &str, result: Value) {
-    let Some(client) = ABILITY_ACK_CLIENT.as_ref() else {
-        return;
-    };
+    let (bid, tid) = ability_context();
+    let key = format!("{ABILITY_ACK_PREFIX}{action}");
     let body = json!({
-        "bid": uuid::Uuid::new_v4().to_string(),
-        "tid": uuid::Uuid::new_v4().to_string(),
         "ts": chrono::Utc::now().timestamp_millis(),
         "data": {
-            "type": BUSINESS,
-            "action": action,
+            "bid": bid,
+            "tid": tid,
             "result": result,
         },
     });
-    if let Err(err) = client
-        .post(ABILITY_ACK_ENDPOINT)
-        .json(&body)
-        .send()
-        .await
-        .and_then(|response| response.error_for_status())
-    {
-        log::warn!("Failed to report ability {action} ack: {err}");
+    if let Err(e) = publish(&key, body.to_string()).await {
+        log::warn!("Failed to report ability {action} ack: {e}");
     }
 }
 
