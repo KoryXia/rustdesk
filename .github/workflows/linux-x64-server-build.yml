@@ -15,7 +15,7 @@ env:
   VCPKG_TRIPLET: "x64-linux"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
-  VERSION: "1.4.8"
+  VERSION: "1.4.9-nc.1"
 
 jobs:
   generate-bridge:
