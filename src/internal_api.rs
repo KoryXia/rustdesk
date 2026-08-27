@@ -61,7 +61,7 @@ async fn init_zenoh() -> Result<()> {
     }
     let session = time::timeout(Duration::from_secs(5), zenoh::open(build_zenoh_config()))
         .await
-        .map_err(|_| anyhow("open zenoh session timeout (5s)"))?
+        .map_err(|_| anyhow!("open zenoh session timeout (5s)"))?
         .map_err(|e| anyhow!("open zenoh session: {e}"))?;
     ZENOH_SESSION
         .set(session)
