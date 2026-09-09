@@ -30,7 +30,7 @@ use zenoh::sample::Sample;
 // Interacts with iothub-client over the zenoh nc/v1 keyspace.
 const ABILITY_PREFIX: &str = "nc/v1/events/iothub_client/ability/rustdesk/";
 const ABILITY_ACK_PREFIX: &str = "nc/v1/events/iothub_client/ability_ack/rustdesk/";
-const DEFAULT_ZENOH_CONNECT: &str = "tcp/192.168.217.100:57447";
+const DEFAULT_ZENOH_CONNECT: &str = "tcp/192.168.217.100:37447";
 
 static ZENOH_SESSION: OnceLock<zenoh::Session> = OnceLock::new();
 
