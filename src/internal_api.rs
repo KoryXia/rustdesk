@@ -177,10 +177,28 @@ enum AbilityAckEvent {
     Stop,
 }
 
+fn run_on_runtime() {
+    let runtime = match hbb_common::tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            log::error!("Failed to create internal API runtime: {err}");
+            return;
+        }
+    };
+    runtime.block_on(run());
+}
+
 pub fn start() {
-    hbb_common::tokio::spawn(async {
-        run().await;
-    });
+    if let Err(err) = std::thread::Builder::new()
+        .name("rustdesk-internal-api".to_owned())
+        .spawn(run_on_runtime)
+    {
+        log::error!("Failed to start internal API thread: {err}");
+    }
 }
 
 async fn run() {
