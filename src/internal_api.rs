@@ -34,6 +34,11 @@ const DEFAULT_ZENOH_CONNECT: &str = "tcp/192.168.217.100:37447";
 
 static ZENOH_SESSION: OnceLock<zenoh::Session> = OnceLock::new();
 
+fn log_ability_warning(message: impl std::fmt::Display) {
+    log::warn!("{message}");
+    eprintln!("WARN {message}");
+}
+
 fn build_zenoh_config() -> zenoh::Config {
     let mut config = zenoh::Config::default();
     let _ = config.insert_json5("mode", "\"client\"");
@@ -97,8 +102,11 @@ struct AbilityEnvelopeData {
 fn ability_action_from_key(key: &str) -> Option<String> {
     let rest = key.strip_prefix(ABILITY_PREFIX)?;
     let mut parts = rest.split('/');
-    let _type = parts.next()?;
-    parts.next().map(str::to_string).filter(|a| !a.is_empty())
+    let action = parts.next()?;
+    if action.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(action.to_owned())
 }
 
 async fn init_ability_subscriber() -> Result<()> {
@@ -116,16 +124,20 @@ async fn init_ability_subscriber() -> Result<()> {
                     let payload = match sample.payload().try_to_string() {
                         Ok(p) => p.to_string(),
                         Err(e) => {
-                            log::warn!("Ability payload not UTF-8: key={key} err={e}");
+                            log_ability_warning(format!(
+                                "Ability payload not UTF-8: key={key} err={e}"
+                            ));
                             continue;
                         }
                     };
                     if let Err(e) = handle_ability(&key, &payload).await {
-                        log::warn!("Failed to handle zenoh ability message: key={key} err={e}");
+                        log_ability_warning(format!(
+                            "Failed to handle zenoh ability message: key={key} err={e}"
+                        ));
                     }
                 }
                 Err(e) => {
-                    log::warn!("Zenoh ability subscription closed: {e}");
+                    log_ability_warning(format!("Zenoh ability subscription closed: {e}"));
                     return;
                 }
             }
@@ -203,30 +215,58 @@ pub fn start() {
 
 async fn run() {
     if let Err(e) = init_zenoh().await {
-        log::warn!("Zenoh init failed: {e}");
+        log_ability_warning(format!("Zenoh init failed: {e}"));
         return;
     }
-    if let Err(e) = init_ability_subscriber().await {
-        log::warn!("Ability subscriber init failed: {e}");
-        return;
-    }
-    let addr = SocketAddr::from(([127, 0, 0, 1], LISTEN_PORT));
     let (ability_ack_tx, ability_ack_rx) = mpsc::channel(16);
     if ABILITY_ACK_TX.set(ability_ack_tx).is_err() {
-        log::warn!("Ability ack channel already initialized");
+        log_ability_warning("Ability ack channel already initialized");
     }
+    let addr = SocketAddr::from(([127, 0, 0, 1], LISTEN_PORT));
     let app = Router::new().route("/account", get(account));
 
     match TcpListener::bind(addr).await {
         Ok(listener) => {
-            log::info!("Internal ability API listening on http://{addr}");
+            if let Err(e) = init_ability_subscriber().await {
+                log_ability_warning(format!("Ability subscriber init failed: {e}"));
+                return;
+            }
             hbb_common::tokio::spawn(ability_ack_worker(ability_ack_rx));
+            log::info!("Internal ability API listening on http://{addr}");
             if let Err(err) = axum::serve(listener, app).await {
                 log::error!("Internal ability API stopped: {err}");
             }
         }
         Err(err) => {
             log::error!("Failed to bind internal ability API on {addr}: {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_action_after_rustdesk_prefix() {
+        assert_eq!(
+            ability_action_from_key("nc/v1/events/iothub_client/ability/rustdesk/start"),
+            Some("start".to_owned())
+        );
+        assert_eq!(
+            ability_action_from_key("nc/v1/events/iothub_client/ability/rustdesk/stop"),
+            Some("stop".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_ability_keys() {
+        for key in [
+            "nc/v1/events/iothub_client/ability/rustdesk/",
+            "nc/v1/events/iothub_client/ability/rustdesk/start/extra",
+            "nc/v1/events/iothub_client/ability/other/start",
+        ] {
+            assert_eq!(ability_action_from_key(key), None);
         }
     }
 }
@@ -242,11 +282,11 @@ async fn account() -> Json<Value> {
 
 async fn queue_ability_ack(event: AbilityAckEvent) {
     let Some(tx) = ABILITY_ACK_TX.get() else {
-        log::warn!("Ability ack channel not initialized");
+        log_ability_warning("Ability ack channel not initialized");
         return;
     };
     if tx.send(event).await.is_err() {
-        log::warn!("Failed to queue ability ack because the worker stopped");
+        log_ability_warning("Failed to queue ability ack because the worker stopped");
     }
 }
 
@@ -300,7 +340,9 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
                             send_ability_ack_with_result("start", result).await;
                         }
                     }
-                    Err(err) => log::warn!("Failed to query current server account data: {err}"),
+                    Err(err) => log_ability_warning(format!(
+                        "Failed to query current server account data: {err}"
+                    )),
                 }
             }
         }
@@ -310,7 +352,9 @@ async fn ability_ack_worker(mut rx: Receiver<AbilityAckEvent>) {
 async fn send_ability_ack(action: &str, status: &str) {
     match account_data(status).await {
         Ok(result) => send_ability_ack_with_result(action, result).await,
-        Err(err) => log::warn!("Failed to query current server for ability {action} ack: {err}"),
+        Err(err) => log_ability_warning(format!(
+            "Failed to query current server for ability {action} ack: {err}"
+        )),
     }
 }
 
@@ -326,7 +370,7 @@ async fn send_ability_ack_with_result(action: &str, result: Value) {
         },
     });
     if let Err(e) = publish(&key, body.to_string()).await {
-        log::warn!("Failed to report ability {action} ack: {e}");
+        log_ability_warning(format!("Failed to report ability {action} ack: {e}"));
     }
 }
 
