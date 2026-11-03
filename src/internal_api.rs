@@ -39,10 +39,16 @@ fn log_ability_warning(message: impl std::fmt::Display) {
     eprintln!("WARN {message}");
 }
 
-fn build_zenoh_config() -> zenoh::Config {
+fn build_zenoh_config() -> Result<zenoh::Config> {
     let mut config = zenoh::Config::default();
     let _ = config.insert_json5("mode", "\"client\"");
     let _ = config.insert_json5("scouting/multicast/enabled", "false");
+    config
+        .insert_json5("connect/timeout_ms", "-1")
+        .map_err(|e| anyhow!("set zenoh connect/timeout_ms: {e}"))?;
+    config
+        .insert_json5("connect/exit_on_failure", "false")
+        .map_err(|e| anyhow!("set zenoh connect/exit_on_failure: {e}"))?;
     let connect = std::env::var("ZENOH_CONNECT")
         .ok()
         .filter(|v| !v.is_empty())
@@ -57,16 +63,15 @@ fn build_zenoh_config() -> zenoh::Config {
             log::warn!("Failed to set zenoh connect/endpoints");
         }
     }
-    config
+    Ok(config)
 }
 
 async fn init_zenoh() -> Result<()> {
     if ZENOH_SESSION.get().is_some() {
         return Ok(());
     }
-    let session = time::timeout(Duration::from_secs(5), zenoh::open(build_zenoh_config()))
+    let session = zenoh::open(build_zenoh_config()?)
         .await
-        .map_err(|_| anyhow!("open zenoh session timeout (5s)"))?
         .map_err(|e| anyhow!("open zenoh session: {e}"))?;
     ZENOH_SESSION
         .set(session)
