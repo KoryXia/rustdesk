@@ -41,28 +41,33 @@ fn log_ability_warning(message: impl std::fmt::Display) {
 
 fn build_zenoh_config() -> Result<zenoh::Config> {
     let mut config = zenoh::Config::default();
-    let _ = config.insert_json5("mode", "\"client\"");
-    let _ = config.insert_json5("scouting/multicast/enabled", "false");
-    config
-        .insert_json5("connect/timeout_ms", "-1")
-        .map_err(|e| anyhow!("set zenoh connect/timeout_ms: {e}"))?;
-    config
-        .insert_json5("connect/exit_on_failure", "false")
-        .map_err(|e| anyhow!("set zenoh connect/exit_on_failure: {e}"))?;
+    for (key, value) in [
+        ("mode", "\"client\""),
+        ("listen/endpoints", "[]"),
+        ("scouting/multicast/enabled", "false"),
+        ("scouting/gossip/enabled", "false"),
+        ("connect/timeout_ms", "-1"),
+        ("connect/exit_on_failure", "false"),
+    ] {
+        config
+            .insert_json5(key, value)
+            .map_err(|error| anyhow!("set zenoh {key}: {error}"))?;
+    }
     let connect = std::env::var("ZENOH_CONNECT")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_ZENOH_CONNECT.to_string());
     let endpoints: Vec<&str> = connect
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if let Ok(json) = serde_json::to_string(&endpoints) {
-        if config.insert_json5("connect/endpoints", &json).is_err() {
-            log::warn!("Failed to set zenoh connect/endpoints");
-        }
+    if endpoints.is_empty() {
+        bail!("ZENOH_CONNECT does not contain a valid endpoint");
     }
+    config
+        .insert_json5("connect/endpoints", &serde_json::to_string(&endpoints)?)
+        .map_err(|error| anyhow!("set zenoh connect/endpoints: {error}"))?;
     Ok(config)
 }
 
